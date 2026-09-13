@@ -474,7 +474,7 @@ class WardrobeMixinTests(unittest.IsolatedAsyncioTestCase):
     async def test_add_from_image_describes_and_stores(self) -> None:
         self.plugin.command_images = [("/tmp/coat.png", "随消息发送的图片")]
         text, _ = await self.plugin._wardrobe_command_payload(None, "u1", "添加图片")
-        self.assertIn("已加入：碎花连衣裙", text)
+        self.assertIn("已加入衣物：碎花连衣裙", text)
         self.assertEqual([""], self.plugin.describe_calls)
         stored = self.plugin.config["wardrobe_items"][0]
         self.assertEqual("碎花连衣裙", stored["name"])
@@ -2629,3 +2629,93 @@ class WardrobeAssetLinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WardrobeImageIngestionRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """识图两态在命令路径上的分流：散件进 items，整套/参考进 outfits。"""
+
+    PNG_1X1 = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000a49444154789c6360000002000100ffff03000006000557bfabd4000000"
+        "0049454e44ae426082"
+    )
+
+    def setUp(self) -> None:
+        self.plugin = _WardrobeCommandHarness()
+        self.plugin.command_images = [("/tmp/coat.png", "随消息发送的图片")]
+
+    async def test_item_reply_lands_in_items_with_slot(self) -> None:
+        self.plugin.describe_reply = {
+            "kind": "item",
+            "name": "米色针织开衫",
+            "description": "细针织落肩版型",
+            "tags": ["居家"],
+            "slot": "upper",
+        }
+        text, _ = await self.plugin._wardrobe_command_payload(None, "u1", "添加图片")
+        self.assertIn("已加入衣物：米色针织开衫", text)
+        items = self.plugin.config["wardrobe_items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("upper", items[0]["slot"])
+        self.assertEqual([], self.plugin.config["wardrobe_outfits"])
+
+    async def test_outfit_reply_lands_in_outfits_not_items(self) -> None:
+        self.plugin.describe_reply = {
+            "kind": "outfit",
+            "name": "白衬衫黑纱裙",
+            "description": "白衬衫配黑色纱裙与厚底鞋",
+            "tags": ["日常"],
+            "slot": "",
+        }
+        text, _ = await self.plugin._wardrobe_command_payload(None, "u1", "添加图片")
+        self.assertIn("已加入整套：白衬衫黑纱裙", text)
+        self.assertEqual([], self.plugin.config["wardrobe_items"])
+        outfits = self.plugin.config["wardrobe_outfits"]
+        self.assertEqual(1, len(outfits))
+        self.assertEqual("style", outfits[0]["kind"])
+        self.assertEqual("owned", outfits[0]["ownership"])
+
+    async def test_reference_reply_is_marked_reference(self) -> None:
+        self.plugin.describe_reply = {
+            "kind": "reference",
+            "name": "博主通勤装",
+            "description": "条纹衬衫配深灰长裤",
+            "tags": [],
+            "slot": "",
+        }
+        await self.plugin._wardrobe_command_payload(None, "u1", "添加图片")
+        outfits = self.plugin.config["wardrobe_outfits"]
+        self.assertEqual(1, len(outfits))
+        self.assertEqual("reference", outfits[0]["ownership"])
+
+    async def test_reply_without_kind_still_adds_an_item(self) -> None:
+        # 旧提示词或旧模型不回「类型」时按散件处理，且部位由名称推断
+        self.plugin.describe_reply = {"name": "碎花连衣裙", "description": "米白底小碎花", "tags": ["外出"]}
+        text, _ = await self.plugin._wardrobe_command_payload(None, "u1", "添加图片")
+        self.assertIn("已加入衣物：碎花连衣裙", text)
+        self.assertEqual("whole", self.plugin.config["wardrobe_items"][0]["slot"])
+
+    async def test_image_is_imported_into_the_asset_store(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "coat.png"
+            source.write_bytes(self.PNG_1X1)
+            self.plugin.data_dir = str(Path(root) / "data")
+            self.plugin.command_images = [(str(source), "随消息发送的图片")]
+            self.plugin.describe_reply = {
+                "kind": "item",
+                "name": "白衬衫",
+                "description": "挺括棉质",
+                "slot": "upper",
+            }
+            await self.plugin._wardrobe_command_payload(None, "u1", "添加图片")
+            item = self.plugin.config["wardrobe_items"][0]
+            self.assertEqual(1, len(item["asset_ids"]))
+            self.assertTrue((Path(self.plugin.data_dir) / "wardrobe_assets" / "index.json").is_file())
+
+    async def test_overview_reports_outfit_count(self) -> None:
+        self.plugin.config["wardrobe_outfits"] = [
+            {"name": "白衬衫黑纱裙", "kind": "style", "style": "白衬衫配黑纱裙", "ownership": "reference"}
+        ]
+        text, _ = await self.plugin._wardrobe_command_payload(None, "u1", "查看")
+        self.assertIn("套", text)
+        self.assertIn("白衬衫黑纱裙（参考", text)

@@ -3924,6 +3924,9 @@ class PrivateCompanionPageApi(
         return self._ok(
             {
                 "source": str(source),
+                # 类型决定去向：散件进 wardrobe_items，整套/参考进 wardrobe_outfits
+                "kind": str(parsed.get("kind") or ""),
+                "slot": str(parsed.get("slot") or ""),
                 "name": parsed.get("name", ""),
                 "description": parsed.get("description", ""),
                 "tags": list(parsed.get("tags") or []),

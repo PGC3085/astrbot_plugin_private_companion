@@ -445,12 +445,26 @@ window.PrivateCompanionWardrobe = (() => {
       const payload = described?.data && typeof described.data === "object" ? described.data : described;
       const description = cleanText(payload?.description, MAX_DESCRIPTION);
       if (!description) throw new Error(payload?.message || "识图模型没有返回可用的衣物描述");
+      const kind = String(payload?.kind || "item").toLowerCase();
+      if (kind === "outfit" || kind === "reference") {
+        // 整套不该塞进散件列表：面板的整套区还没接线，这里先明确告知，
+        // 并指向已经支持整套入库的命令路径。
+        setStatus(
+          context,
+          kind === "reference"
+            ? "识图判定这是一套参考穿搭：请用「陪伴 衣柜 添加图片」入库；面板整套编辑还没接线。"
+            : "识图判定这是一整套：请用「陪伴 衣柜 添加图片」入库；面板整套编辑还没接线。",
+          "error",
+        );
+        return;
+      }
       const draft = {
         name: cleanText(payload?.name, MAX_NAME) || cleanText(description, 12),
         description,
       };
       const result = upsertItem(context, draft, {
         tags: payload?.tags,
+        slot: cleanText(payload?.slot, 20),
         source,
         source_kind: "image",
       });

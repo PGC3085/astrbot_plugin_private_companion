@@ -27,6 +27,11 @@ from .persona_config import PERSONA_SETTINGS_KEY, runtime_persona_setting
 from .wardrobe import (
     OUTFIT_KIND_BUNDLE,
     OUTFIT_KIND_STYLE,
+    OWNERSHIP_OWNED,
+    OWNERSHIP_REFERENCE,
+    WARDROBE_IMAGE_KIND_ITEM,
+    WARDROBE_IMAGE_KIND_OUTFIT,
+    WARDROBE_IMAGE_KIND_REFERENCE,
     SOURCE_KIND_IMAGE,
     SOURCE_KIND_MANUAL,
     WARDROBE_MAX_ITEMS,
@@ -44,6 +49,7 @@ from .wardrobe import (
     delete_wardrobe_outfit,
     find_wardrobe_item,
     find_wardrobe_outfit,
+    infer_wardrobe_slot,
     normalize_wardrobe_image_prompt,
     normalize_wardrobe_items,
     normalize_wardrobe_outfits,
@@ -59,6 +65,7 @@ from .wardrobe import (
     update_wardrobe_outfit,
     wardrobe_summary_lines,
 )
+from .wardrobe_assets import ASSET_ORIGIN_BLOGGER, ASSET_ORIGIN_PANEL, import_asset
 
 WARDROBE_PROMPT_KEY = "wardrobe.character"
 
@@ -223,6 +230,7 @@ class WardrobeMixin:
         *,
         tendency: str | None = None,
         items: list[dict[str, Any]] | None = None,
+        outfits: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Persist wardrobe config atomically; roll back the runtime on failure."""
 
@@ -231,11 +239,14 @@ class WardrobeMixin:
             payload["wardrobe_tendency"] = normalize_wardrobe_tendency(tendency)
         if items is not None:
             payload["wardrobe_items"] = normalize_wardrobe_items(items)
+        if outfits is not None:
+            payload["wardrobe_outfits"] = normalize_wardrobe_outfits(outfits)
         if not payload:
             return True
         runtime_attr = {
             "wardrobe_tendency": "wardrobe_tendency",
             "wardrobe_items": "wardrobe_items",
+            "wardrobe_outfits": "wardrobe_outfits",
         }
         # Capture both layers so a failed save restores the exact previous
         # state instead of writing a placeholder back into the config.
@@ -804,10 +815,30 @@ class WardrobeMixin:
     # 命令
     # ------------------------------------------------------------------
 
+    def _import_wardrobe_asset(
+        self, path: str, *, origin: str = ASSET_ORIGIN_PANEL, note: str = ""
+    ) -> str:
+        """Best-effort copy of one image into the asset store.
+
+        Returns "" when the plugin has no data dir or the copy fails：素材落盘失败
+        不该让"加衣物"这条命令整体失败，衣物本身仍然能入库。
+        """
+
+        data_dir = getattr(self, "data_dir", "")
+        if not data_dir:
+            return ""
+        try:
+            record, _ = import_asset(data_dir, path, origin=origin, origin_note=note)
+        except Exception as exc:
+            logger.debug("衣柜素材导入失败: %s", _single_line(exc, 160))
+            return ""
+        return str(record.get("id") or "")
+
     def _wardrobe_overview_text(self) -> str:
         tendency = self._wardrobe_tendency()
         items = self._wardrobe_items()
-        lines = [f"角色衣柜：{len(items)}/{WARDROBE_MAX_ITEMS} 件"]
+        outfits = self._wardrobe_outfits()
+        lines = [f"角色衣柜：{len(items)}/{WARDROBE_MAX_ITEMS} 件、{len(outfits)}/{WARDROBE_MAX_OUTFITS} 套"]
         lines.append(f"启用：{'是' if self._wardrobe_enabled() else '否'}；写入提示词：{'是' if self._wardrobe_prompt_mode() else '否'}")
         lines.append(f"整体服饰倾向：{tendency or '（未设置）'}")
         if items:
@@ -815,6 +846,11 @@ class WardrobeMixin:
             lines.extend(wardrobe_summary_lines(items, description_limit=60))
         else:
             lines.append("具体衣物：（还没有）")
+        if outfits:
+            lines.append("整套：")
+            for index, outfit in enumerate(outfits, start=1):
+                tag = "参考" if str(outfit.get("ownership") or "") == OWNERSHIP_REFERENCE else "自有"
+                lines.append(f"{index}. {outfit['name']}（{tag}·{len(outfit.get('items') or [])} 件）")
         lines.append("")
         lines.append("维护方式：")
         lines.extend(self._wardrobe_help_lines())
@@ -825,7 +861,7 @@ class WardrobeMixin:
         return [
             "陪伴 衣柜 倾向 <整体服饰倾向描述>",
             "陪伴 衣柜 添加 <名称> | <描述>",
-            "陪伴 衣柜 添加图片 <可选备注>（带图或回复图片发送）",
+            "陪伴 衣柜 添加图片 <可选备注>（带图或回复图片发送；自动区分散件与整套）",
             "陪伴 衣柜 修改 <编号或名称> <新描述>",
             "陪伴 衣柜 删除 <编号或名称>",
             "陪伴 衣柜 清空",
@@ -939,8 +975,12 @@ class WardrobeMixin:
             )
         note = _single_line(argument, 200)
         items = self._wardrobe_items()
+        outfits = self._wardrobe_outfits()
         added: list[str] = []
         replaced: list[str] = []
+        outfits_added: list[str] = []
+        outfits_replaced: list[str] = []
+        skipped: list[str] = []
         failures: list[str] = []
         for path, label in images[:limit]:
             parsed, error = await self._wardrobe_describe_image(
@@ -951,37 +991,84 @@ class WardrobeMixin:
             if parsed is None:
                 failures.append(f"{_single_line(label, 80) or '图片'}：{error}")
                 continue
-            existing = find_wardrobe_item(items, parsed["name"])
+            kind = str(parsed.get("kind") or WARDROBE_IMAGE_KIND_ITEM)
+            name = str(parsed.get("name") or "")
+            # 图片同时进素材层：图与语义记录解耦，删记录不删图。
+            asset_id = self._import_wardrobe_asset(path, origin=ASSET_ORIGIN_PANEL, note=note)
+            asset_ids = [asset_id] if asset_id else None
+            if kind in (WARDROBE_IMAGE_KIND_OUTFIT, WARDROBE_IMAGE_KIND_REFERENCE):
+                existing_outfit = find_wardrobe_outfit(outfits, name)
+                try:
+                    outfits, stored = add_wardrobe_outfit(
+                        outfits,
+                        name=name,
+                        kind=OUTFIT_KIND_STYLE,
+                        style=str(parsed.get("description") or ""),
+                        asset_ids=asset_ids,
+                        ownership=(
+                            OWNERSHIP_REFERENCE
+                            if kind == WARDROBE_IMAGE_KIND_REFERENCE
+                            else OWNERSHIP_OWNED
+                        ),
+                    )
+                except WardrobeLimitError as exc:
+                    failures.append(str(exc))
+                    break
+                except WardrobeError as exc:
+                    failures.append(f"{name}：{exc}")
+                    continue
+                (outfits_replaced if existing_outfit else outfits_added).append(stored["name"])
+                continue
+            if kind != WARDROBE_IMAGE_KIND_ITEM:
+                skipped.append(f"{_single_line(label, 80) or name}：{kind}")
+                continue
+            existing = find_wardrobe_item(items, name)
+            # 部位兜底：解析器已经推断过一次；这里再兜一层，防止别的调用方
+            # 只给 name/description 时散件又变成"未分类"（那是 select 模式的死角）。
+            slot = str(parsed.get("slot") or "") or infer_wardrobe_slot(
+                name, str(parsed.get("description") or "")
+            )
             try:
                 items, stored = add_wardrobe_item(
                     items,
-                    name=parsed["name"],
-                    description=parsed["description"],
-                    tags=parsed["tags"],
+                    name=name,
+                    # 识图后端字段缺失不该让命令崩：一律按可选处理
+                    description=parsed.get("description") or "",
+                    tags=parsed.get("tags"),
+                    slot=slot,
                     source=path,
                     source_kind=SOURCE_KIND_IMAGE,
+                    asset_ids=asset_ids,
                 )
             except WardrobeLimitError as exc:
                 failures.append(str(exc))
                 break
             except WardrobeError as exc:
-                failures.append(f"{parsed['name']}：{exc}")
+                failures.append(f"{name}：{exc}")
                 continue
             (replaced if existing else added).append(stored["name"])
-        if not added and not replaced:
-            detail = "\n".join(failures[:5]) if failures else "没有识别出可用的衣物。"
-            return f"没有把衣物加入衣柜：\n{detail}", ""
-        if not await self._save_wardrobe_state(items=items):
+        if not (added or replaced or outfits_added or outfits_replaced):
+            detail = chr(10).join(failures[:5]) if failures else "没有识别出可用的衣物。"
+            return f"没有把衣物加入衣柜：{chr(10)}{detail}", ""
+        if not await self._save_wardrobe_state(items=items, outfits=outfits):
             return "衣物已识别，但保存失败，请到面板确认配置是否可写。", ""
         lines = []
         if added:
-            lines.append("已加入：" + "、".join(added))
+            lines.append("已加入衣物：" + "、".join(added))
         if replaced:
-            lines.append("已更新：" + "、".join(replaced))
+            lines.append("已更新衣物：" + "、".join(replaced))
+        if outfits_added:
+            lines.append("已加入整套：" + "、".join(outfits_added))
+        if outfits_replaced:
+            lines.append("已更新整套：" + "、".join(outfits_replaced))
+        if skipped:
+            lines.append("已跳过：" + "；".join(skipped[:3]))
         if failures:
             lines.append("未处理：" + "；".join(failures[:3]))
-        lines.append(f"衣柜现有 {len(items)}/{WARDROBE_MAX_ITEMS} 件。")
-        return "\n".join(lines), ""
+        lines.append(
+            f"衣柜现有 {len(items)}/{WARDROBE_MAX_ITEMS} 件、{len(outfits)}/{WARDROBE_MAX_OUTFITS} 套。"
+        )
+        return chr(10).join(lines), ""
 
     async def _wardrobe_update(self, argument: str) -> tuple[str, str]:
         reference, _, description = str(argument or "").partition(" ")

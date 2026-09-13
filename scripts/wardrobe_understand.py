@@ -129,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     print(f"{'asset':<22}{'类型':<8}{'名称':<16}{'部位':<7}去向")
     for row in rows:
+        if row.get("error"):
+            print(f"{row['asset_id']:<22}{'—':<8}{row['error']}")
+            continue
         print(f"{row['asset_id']:<22}{row.get('kind',''):<8}{row.get('name',''):<16}"
               f"{row.get('slot','') or '-':<7}{row.get('landed','')}")
     print()
