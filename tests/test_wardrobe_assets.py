@@ -19,12 +19,14 @@ from astrbot_plugin_private_companion.wardrobe_assets import (
     image_dimensions,
     import_asset,
     import_directory,
+    list_pending_drafts,
     load_asset_draft,
     load_asset_index,
     normalize_asset,
     normalize_asset_index,
     normalize_asset_kind,
     normalize_asset_origin,
+    mark_asset_status,
     save_asset_index,
     scan_source_dir,
     sha256_file,
@@ -170,6 +172,47 @@ class AssetScanAndDraftTests(unittest.TestCase):
             payload = json.loads((data_dir / "wardrobe_assets" / "index.json").read_text(encoding="utf-8"))
             self.assertIn("assets", payload)
             self.assertEqual(1, len(payload["assets"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class AssetDraftQueueTests(unittest.TestCase):
+    """草稿队列：待确认列表与状态标记。"""
+
+    def test_pending_lists_imported_assets_with_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source = _write_png(Path(root) / "src" / "a.png")
+            data_dir = Path(root) / "data"
+            record, _ = import_asset(data_dir, source, origin=ASSET_ORIGIN_BLOGGER)
+            write_asset_draft(data_dir, record["id"], {"kind": "outfit", "name": "白衬衫黑纱裙"})
+            rows = list_pending_drafts(data_dir)
+            self.assertEqual(1, len(rows))
+            self.assertTrue(rows[0]["has_draft"])
+            self.assertEqual("outfit", rows[0]["kind"])
+            self.assertEqual("白衬衫黑纱裙", rows[0]["name"])
+            self.assertTrue(Path(rows[0]["path"]).is_file())
+
+    def test_pending_without_draft_is_still_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source = _write_png(Path(root) / "src" / "a.png")
+            data_dir = Path(root) / "data"
+            import_asset(data_dir, source)
+            rows = list_pending_drafts(data_dir)
+            self.assertEqual(1, len(rows))
+            self.assertFalse(rows[0]["has_draft"])
+
+    def test_mark_status_removes_from_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source = _write_png(Path(root) / "src" / "a.png")
+            data_dir = Path(root) / "data"
+            record, _ = import_asset(data_dir, source)
+            updated = mark_asset_status(data_dir, record["id"], ASSET_STATUS_REJECTED)
+            assert updated is not None
+            self.assertEqual(ASSET_STATUS_REJECTED, updated["status"])
+            self.assertEqual([], list_pending_drafts(data_dir))
+            self.assertIsNone(mark_asset_status(data_dir, "asset_missing", ASSET_STATUS_REJECTED))
 
 
 if __name__ == "__main__":

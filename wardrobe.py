@@ -231,6 +231,7 @@ __all__ = [
     "render_wardrobe_outfit_prompt",
     "build_wardrobe_image_instruction",
     "parse_wardrobe_image_reply",
+    "apply_wardrobe_draft",
     "OUTFIT_KIND_STYLE",
     "OUTFIT_KIND_BUNDLE",
     "WARDROBE_OUTFIT_KINDS",
@@ -397,17 +398,24 @@ _IMAGE_KIND_ALIASES: dict[str, str] = {
     "单品": WARDROBE_IMAGE_KIND_ITEM,
     "一件": WARDROBE_IMAGE_KIND_ITEM,
     "item": WARDROBE_IMAGE_KIND_ITEM,
+    "衣物": WARDROBE_IMAGE_KIND_ITEM,
+    "衣服": WARDROBE_IMAGE_KIND_ITEM,
+    "服装": WARDROBE_IMAGE_KIND_ITEM,
     "整套": WARDROBE_IMAGE_KIND_OUTFIT,
     "全身": WARDROBE_IMAGE_KIND_OUTFIT,
     "搭配": WARDROBE_IMAGE_KIND_OUTFIT,
     "一套": WARDROBE_IMAGE_KIND_OUTFIT,
     "outfit": WARDROBE_IMAGE_KIND_OUTFIT,
     "look": WARDROBE_IMAGE_KIND_OUTFIT,
+    "穿搭": WARDROBE_IMAGE_KIND_OUTFIT,
+    "一身": WARDROBE_IMAGE_KIND_OUTFIT,
     "参考": WARDROBE_IMAGE_KIND_REFERENCE,
     "灵感": WARDROBE_IMAGE_KIND_REFERENCE,
     "种草": WARDROBE_IMAGE_KIND_REFERENCE,
     "reference": WARDROBE_IMAGE_KIND_REFERENCE,
     "inspiration": WARDROBE_IMAGE_KIND_REFERENCE,
+    "别人": WARDROBE_IMAGE_KIND_REFERENCE,
+    "博主": WARDROBE_IMAGE_KIND_REFERENCE,
     "无关": WARDROBE_IMAGE_KIND_NONE,
     "无": WARDROBE_IMAGE_KIND_NONE,
     "没有": WARDROBE_IMAGE_KIND_NONE,
@@ -1103,8 +1111,13 @@ def parse_wardrobe_image_reply(text: Any) -> dict[str, Any] | None:
     if raw.strip().casefold() in _EMPTY_REPLY_TOKENS:
         return None
     fields, unlabelled = _split_labelled_lines(raw)
-    kind = normalize_wardrobe_image_kind(fields.get("kind"))
+    raw_kind = fields.get("kind")
+    kind = normalize_wardrobe_image_kind(raw_kind)
     if kind == WARDROBE_IMAGE_KIND_NONE:
+        return None
+    if raw_kind and not kind:
+        # 模型明确写了类型但认不出来：宁可整条不要，也别猜错库
+        # （缺类型是另一回事，那是旧提示词的兼容路径，按散件处理）。
         return None
     description = clean_wardrobe_text(fields.get("description"), WARDROBE_MAX_DESCRIPTION)
     if not description and unlabelled:
@@ -1554,6 +1567,101 @@ def _outfit_profile_text(item: Mapping[str, Any]) -> str:
     if name and detail:
         return f"{name}，{detail}"
     return name or detail
+
+
+def apply_wardrobe_draft(
+    items: Sequence[Mapping[str, Any]] | None,
+    outfits: Sequence[Mapping[str, Any]] | None,
+    draft: Mapping[str, Any] | None,
+    *,
+    asset_id: Any = "",
+    source: Any = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Route one understanding-layer draft into items / outfits.
+
+    返回 (items, outfits, outcome)，outcome 形如
+    {ok, kind, name, replaced, limit, error}。
+
+    命令路径（聊天里发图）与草稿队列（批量确认）共用这一处分流逻辑，
+    所以"一张图到底进哪个库"只有一个实现。
+    """
+
+    current_items = normalize_wardrobe_items(list(items or ()))
+    current_outfits = normalize_wardrobe_outfits(list(outfits or ()))
+    payload = draft if isinstance(draft, Mapping) else {}
+    raw_kind = clean_wardrobe_text(payload.get("kind"), 32)
+    kind = normalize_wardrobe_image_kind(raw_kind)
+    name = clean_wardrobe_text(payload.get("name"), WARDROBE_MAX_NAME)
+    clean_asset = clean_wardrobe_text(asset_id, 80)
+    asset_ids = [clean_asset] if clean_asset else None
+    clean_source = clean_wardrobe_text(source, WARDROBE_MAX_SOURCE)
+    outcome: dict[str, Any] = {
+        "ok": False,
+        "kind": kind,
+        "name": name,
+        "replaced": False,
+        "limit": False,
+        "error": "",
+    }
+
+    if raw_kind and not kind:
+        outcome["error"] = f"无法识别的类型：{raw_kind}"
+        return current_items, current_outfits, outcome
+    if not kind:
+        # 缺类型＝旧格式，按散件处理（向后兼容）
+        kind = WARDROBE_IMAGE_KIND_ITEM
+        outcome["kind"] = kind
+
+    if kind in (WARDROBE_IMAGE_KIND_OUTFIT, WARDROBE_IMAGE_KIND_REFERENCE):
+        existing = find_wardrobe_outfit(current_outfits, name)
+        try:
+            current_outfits, stored = add_wardrobe_outfit(
+                current_outfits,
+                name=name,
+                kind=OUTFIT_KIND_STYLE,
+                style=clean_wardrobe_text(payload.get("description"), WARDROBE_MAX_DESCRIPTION),
+                asset_ids=asset_ids,
+                ownership=(
+                    OWNERSHIP_REFERENCE
+                    if kind == WARDROBE_IMAGE_KIND_REFERENCE
+                    else OWNERSHIP_OWNED
+                ),
+            )
+        except WardrobeLimitError as exc:
+            outcome.update(error=str(exc), limit=True)
+            return current_items, current_outfits, outcome
+        except WardrobeError as exc:
+            outcome["error"] = f"{name}：{exc}"
+            return current_items, current_outfits, outcome
+        outcome.update(ok=True, name=stored["name"], replaced=bool(existing))
+        return current_items, current_outfits, outcome
+
+    if kind != WARDROBE_IMAGE_KIND_ITEM:
+        outcome["error"] = f"未知类型：{kind or '（空）'}"
+        return current_items, current_outfits, outcome
+
+    description = clean_wardrobe_text(payload.get("description"), WARDROBE_MAX_DESCRIPTION)
+    existing_item = find_wardrobe_item(current_items, name)
+    slot = normalize_wardrobe_slot(payload.get("slot")) or infer_wardrobe_slot(name, description)
+    try:
+        current_items, stored_item = add_wardrobe_item(
+            current_items,
+            name=name,
+            description=description,
+            tags=payload.get("tags"),
+            slot=slot,
+            source=clean_source,
+            source_kind=SOURCE_KIND_IMAGE if clean_source else SOURCE_KIND_MANUAL,
+            asset_ids=asset_ids,
+        )
+    except WardrobeLimitError as exc:
+        outcome.update(error=str(exc), limit=True)
+        return current_items, current_outfits, outcome
+    except WardrobeError as exc:
+        outcome["error"] = f"{name}：{exc}"
+        return current_items, current_outfits, outcome
+    outcome.update(ok=True, name=stored_item["name"], replaced=bool(existing_item))
+    return current_items, current_outfits, outcome
 
 
 def _render_picked_outfit(picked: Sequence[Mapping[str, Any]]) -> str:

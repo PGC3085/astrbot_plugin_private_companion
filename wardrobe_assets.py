@@ -432,6 +432,53 @@ def import_directory(
     return stats
 
 
+def list_pending_drafts(data_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """List assets still waiting for confirmation, with whatever draft exists.
+
+    草稿可能还没生成（只导入了图），所以 draft 字段允许为空——面板与 CLI
+    都能据此区分"等识图"和"等确认"。
+    """
+
+    index = load_asset_index(data_dir)
+    rows: list[dict[str, Any]] = []
+    for asset_id, record in index.items():
+        if str(record.get("status") or ASSET_STATUS_IMPORTED) != ASSET_STATUS_IMPORTED:
+            continue
+        draft = load_asset_draft(data_dir, asset_id) or {}
+        rows.append(
+            {
+                "asset_id": asset_id,
+                "origin": str(record.get("origin") or ""),
+                "path": str(asset_abs_path(data_dir, record)),
+                "width": int(record.get("width") or 0),
+                "height": int(record.get("height") or 0),
+                "has_draft": bool(draft),
+                "kind": str(draft.get("kind") or ""),
+                "name": str(draft.get("name") or ""),
+                "description": str(draft.get("description") or ""),
+                "slot": str(draft.get("slot") or ""),
+                "tags": [str(tag) for tag in (draft.get("tags") or ())],
+            }
+        )
+    rows.sort(key=lambda row: row["asset_id"])
+    return rows
+
+
+def mark_asset_status(
+    data_dir: str | os.PathLike[str], asset_id: str, status: str
+) -> dict[str, Any] | None:
+    """Update one asset status in the index; returns the record or None."""
+
+    index = load_asset_index(data_dir)
+    record = index.get(str(asset_id or ""))
+    if record is None:
+        return None
+    record["status"] = normalize_asset_status(status)
+    index[record["id"]] = record
+    save_asset_index(data_dir, index)
+    return record
+
+
 def write_asset_draft(
     data_dir: str | os.PathLike[str], asset_id: str, draft: Mapping[str, Any]
 ) -> Path:
@@ -488,6 +535,8 @@ __all__ = [
     "image_dimensions",
     "import_asset",
     "import_directory",
+    "list_pending_drafts",
+    "mark_asset_status",
     "load_asset_draft",
     "load_asset_index",
     "normalize_asset",

@@ -42,6 +42,7 @@ from .wardrobe import (
     WardrobeLimitError,
     add_wardrobe_item,
     add_wardrobe_outfit,
+    apply_wardrobe_draft,
     build_wardrobe_image_instruction,
     build_wardrobe_outfit_request,
     clear_wardrobe,
@@ -1036,7 +1037,6 @@ class WardrobeMixin:
         replaced: list[str] = []
         outfits_added: list[str] = []
         outfits_replaced: list[str] = []
-        skipped: list[str] = []
         failures: list[str] = []
         for path, label in images[:limit]:
             parsed, error = await self._wardrobe_describe_image(
@@ -1047,62 +1047,25 @@ class WardrobeMixin:
             if parsed is None:
                 failures.append(f"{_single_line(label, 80) or '图片'}：{error}")
                 continue
-            kind = str(parsed.get("kind") or WARDROBE_IMAGE_KIND_ITEM)
-            name = str(parsed.get("name") or "")
             # 图片同时进素材层：图与语义记录解耦，删记录不删图。
             asset_id = self._import_wardrobe_asset(path, origin=ASSET_ORIGIN_PANEL, note=note)
-            asset_ids = [asset_id] if asset_id else None
-            if kind in (WARDROBE_IMAGE_KIND_OUTFIT, WARDROBE_IMAGE_KIND_REFERENCE):
-                existing_outfit = find_wardrobe_outfit(outfits, name)
-                try:
-                    outfits, stored = add_wardrobe_outfit(
-                        outfits,
-                        name=name,
-                        kind=OUTFIT_KIND_STYLE,
-                        style=str(parsed.get("description") or ""),
-                        asset_ids=asset_ids,
-                        ownership=(
-                            OWNERSHIP_REFERENCE
-                            if kind == WARDROBE_IMAGE_KIND_REFERENCE
-                            else OWNERSHIP_OWNED
-                        ),
-                    )
-                except WardrobeLimitError as exc:
-                    failures.append(str(exc))
-                    break
-                except WardrobeError as exc:
-                    failures.append(f"{name}：{exc}")
-                    continue
-                (outfits_replaced if existing_outfit else outfits_added).append(stored["name"])
-                continue
-            if kind != WARDROBE_IMAGE_KIND_ITEM:
-                skipped.append(f"{_single_line(label, 80) or name}：{kind}")
-                continue
-            existing = find_wardrobe_item(items, name)
-            # 部位兜底：解析器已经推断过一次；这里再兜一层，防止别的调用方
-            # 只给 name/description 时散件又变成"未分类"（那是 select 模式的死角）。
-            slot = str(parsed.get("slot") or "") or infer_wardrobe_slot(
-                name, str(parsed.get("description") or "")
+            # 分流只有一处实现（数据层 apply_wardrobe_draft），命令路径与草稿队列共用。
+            items, outfits, outcome = apply_wardrobe_draft(
+                items, outfits, parsed, asset_id=asset_id, source=path
             )
-            try:
-                items, stored = add_wardrobe_item(
-                    items,
-                    name=name,
-                    # 识图后端字段缺失不该让命令崩：一律按可选处理
-                    description=parsed.get("description") or "",
-                    tags=parsed.get("tags"),
-                    slot=slot,
-                    source=path,
-                    source_kind=SOURCE_KIND_IMAGE,
-                    asset_ids=asset_ids,
-                )
-            except WardrobeLimitError as exc:
-                failures.append(str(exc))
-                break
-            except WardrobeError as exc:
-                failures.append(f"{name}：{exc}")
+            if not outcome.get("ok"):
+                failures.append(str(outcome.get("error") or "没有识别出可用的衣物。"))
+                if outcome.get("limit"):
+                    break
                 continue
-            (replaced if existing else added).append(stored["name"])
+            stored_name = str(outcome.get("name") or "")
+            if str(outcome.get("kind") or "") in (
+                WARDROBE_IMAGE_KIND_OUTFIT,
+                WARDROBE_IMAGE_KIND_REFERENCE,
+            ):
+                (outfits_replaced if outcome.get("replaced") else outfits_added).append(stored_name)
+            else:
+                (replaced if outcome.get("replaced") else added).append(stored_name)
         if not (added or replaced or outfits_added or outfits_replaced):
             detail = chr(10).join(failures[:5]) if failures else "没有识别出可用的衣物。"
             return f"没有把衣物加入衣柜：{chr(10)}{detail}", ""
@@ -1117,8 +1080,6 @@ class WardrobeMixin:
             lines.append("已加入整套：" + "、".join(outfits_added))
         if outfits_replaced:
             lines.append("已更新整套：" + "、".join(outfits_replaced))
-        if skipped:
-            lines.append("已跳过：" + "；".join(skipped[:3]))
         if failures:
             lines.append("未处理：" + "；".join(failures[:3]))
         lines.append(

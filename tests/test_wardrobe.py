@@ -55,6 +55,7 @@ from astrbot_plugin_private_companion.wardrobe import (
     WardrobeLimitError,
     add_wardrobe_item,
     add_wardrobe_outfit,
+    apply_wardrobe_draft,
     build_wardrobe_image_instruction,
     build_wardrobe_outfit_request,
     clear_wardrobe,
@@ -2775,3 +2776,61 @@ class WardrobeReferenceIsolationTests(unittest.IsolatedAsyncioTestCase):
         self._config_with_reference()
         text = self.plugin._wardrobe_overview_text()
         self.assertIn("参考整套（参考", text)
+
+
+class WardrobeDraftRoutingTests(unittest.TestCase):
+    """数据层的分流函数：命令路径与草稿队列共用它，所以要单独钉死。"""
+
+    def test_item_draft_links_asset_and_infers_slot(self) -> None:
+        items, outfits, outcome = apply_wardrobe_draft(
+            None, None,
+            {"kind": "item", "name": "深蓝牛仔裤", "description": "直筒微弹", "tags": ["日常"]},
+            asset_id="asset_1",
+        )
+        self.assertTrue(outcome["ok"])
+        self.assertEqual("lower", items[0]["slot"])
+        self.assertEqual(["asset_1"], items[0]["asset_ids"])
+        self.assertEqual([], outfits)
+
+    def test_outfit_draft_goes_to_outfits(self) -> None:
+        items, outfits, outcome = apply_wardrobe_draft(
+            None, None, {"kind": "outfit", "name": "通勤正装", "description": "衬衫配长裤"}
+        )
+        self.assertTrue(outcome["ok"])
+        self.assertEqual([], items)
+        self.assertEqual("style", outfits[0]["kind"])
+        self.assertEqual("owned", outfits[0]["ownership"])
+
+    def test_reference_draft_is_marked_reference(self) -> None:
+        _, outfits, _ = apply_wardrobe_draft(
+            None, None, {"kind": "reference", "name": "博主通勤装", "description": "条纹衬衫"}
+        )
+        self.assertEqual("reference", outfits[0]["ownership"])
+
+    def test_unknown_kind_is_reported_not_guessed(self) -> None:
+        items, outfits, outcome = apply_wardrobe_draft(
+            None, None, {"kind": "看起来像衣服", "name": "x", "description": "y"}
+        )
+        self.assertFalse(outcome["ok"])
+        self.assertIn("无法识别的类型", outcome["error"])
+        self.assertEqual([], items)
+        self.assertEqual([], outfits)
+
+    def test_existing_name_is_replaced_not_duplicated(self) -> None:
+        items, _, _ = apply_wardrobe_draft(
+            None, None, {"kind": "item", "name": "开衫", "description": "薄款", "slot": "upper"}
+        )
+        items, _, outcome = apply_wardrobe_draft(
+            items, None, {"kind": "item", "name": "开衫", "description": "厚款", "slot": "upper"}
+        )
+        self.assertTrue(outcome["replaced"])
+        self.assertEqual(1, len(items))
+        self.assertEqual("厚款", items[0]["description"])
+
+    def test_wardrobe_limit_is_flagged(self) -> None:
+        full = [{"id": f"w{i}", "name": f"衣{i}", "slot": "upper"} for i in range(WARDROBE_MAX_ITEMS)]
+        _, _, outcome = apply_wardrobe_draft(
+            full, None, {"kind": "item", "name": "新衣", "description": "x", "slot": "upper"}
+        )
+        self.assertFalse(outcome["ok"])
+        self.assertTrue(outcome["limit"])

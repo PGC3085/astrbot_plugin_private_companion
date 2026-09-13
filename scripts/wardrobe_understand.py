@@ -49,6 +49,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replies", required=True, help="asset_id → 模型回复文本 的 JSON")
     parser.add_argument("--wardrobe-file", default="", help="落库结果写到哪里（默认 <data-dir>/wardrobe_preview.json）")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--draft-only",
+        action="store_true",
+        help="只写草稿并保持 status=imported，交给 wardrobe_review.py 确认（推荐批量导入时使用）",
+    )
     args = parser.parse_args(argv)
 
     replies = json.loads(Path(args.replies).read_text(encoding="utf-8"))
@@ -71,6 +76,18 @@ def main(argv: list[str] | None = None) -> int:
             index[asset_id] = record
             write_asset_draft(args.data_dir, asset_id, {"kind": "none", "reason": "无可辨认衣物"})
             rows.append({"asset_id": asset_id, "kind": "none", "name": "", "slot": "", "landed": "rejected"})
+            continue
+        if args.draft_only:
+            # 草稿队列模式：只落草稿，等用户确认；素材状态保持 imported
+            write_asset_draft(args.data_dir, asset_id, draft)
+            rows.append({
+                "asset_id": asset_id,
+                "kind": draft["kind"],
+                "name": draft["name"],
+                "slot": draft["slot"],
+                "tags": draft["tags"],
+                "landed": "draft",
+            })
             continue
         kind = draft["kind"]
         landed = ""
@@ -117,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = {
         "assets": len(replies),
+        "drafts": sum(1 for r in rows if r.get("landed") == "draft"),
         "items": sum(1 for r in rows if r.get("landed") == "items"),
         "outfits": sum(1 for r in rows if str(r.get("landed", "")).startswith("outfits/")),
         "rejected": sum(1 for r in rows if r.get("landed") == "rejected"),
