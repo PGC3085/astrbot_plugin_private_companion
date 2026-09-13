@@ -124,6 +124,70 @@ class PrivateReplyScopeAndTimeAnchorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("我刚才把话题接偏了", cleaned)
 
+    def test_daytime_clock_mention_is_not_a_late_night_anchor(self):
+        """白天的 11 点只是时间事实：行程、用药、约见都不该被判成深夜宣言。"""
+        harness = _TimeAnchorHarness()
+
+        for text in (
+            "行程是 9 点出门、11 点到站，午饭在车上解决。",
+            "把闹钟设在十一点半，别提前热。",
+            "会议定在 11 点半开始。",
+            "预约在 11 点前后，出门留够半小时。",
+        ):
+            self.assertFalse(harness._response_has_invalid_current_time_anchor(text), text)
+
+    def test_local_fallback_keeps_daytime_clock_mention(self):
+        """即使这一轮已被标记，本地兜底也不该删掉白天的钟点，更不能只删半截。"""
+        harness = _TimeAnchorHarness()
+
+        for text in (
+            "行程是 9 点出门、11 点到站，午饭在车上解决。",
+            "把闹钟设在十一点半，别提前热。",
+            "预约在 11 点前后，出门留够半小时。",
+        ):
+            cleaned = harness._fallback_temporal_or_continuity_confused_reply(
+                "什么",
+                text,
+                flags=["invalid_current_time_anchor"],
+                user={},
+            )
+            self.assertEqual(text, cleaned)
+
+    def test_late_clock_claim_with_sleep_cue_still_flagged(self):
+        harness = _TimeAnchorHarness()
+
+        for text in (
+            "快十一点了，困不困？",
+            "都十一点了，该睡了吧。",
+            "十一点了，早点睡。",
+        ):
+            self.assertTrue(harness._response_has_invalid_current_time_anchor(text), text)
+
+    def test_local_fallback_removes_complete_late_clock_claim(self):
+        harness = _TimeAnchorHarness()
+
+        cleaned = harness._fallback_temporal_or_continuity_confused_reply(
+            "什么",
+            "今晚的安排记下了。快十一点了，困不困？",
+            flags=["invalid_current_time_anchor"],
+            user={},
+        )
+
+        self.assertEqual("今晚的安排记下了", cleaned)
+
+    def test_local_fallback_keeps_text_after_implicit_late_claim(self):
+        """「时间不早了」后面没有睡意线索时，只删这句宣言，不吃掉后面那句话。"""
+        harness = _TimeAnchorHarness()
+
+        cleaned = harness._fallback_temporal_or_continuity_confused_reply(
+            "什么",
+            "时间不早了，先吃饭吧。",
+            flags=["invalid_current_time_anchor"],
+            user={},
+        )
+
+        self.assertEqual("先吃饭吧。", cleaned)
+
     def test_routine_check_boundary_requires_evidence_and_one_focus(self):
         plugin = PrivateCompanionPlugin.__new__(PrivateCompanionPlugin)
 
