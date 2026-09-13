@@ -2719,3 +2719,59 @@ class WardrobeImageIngestionRoutingTests(unittest.IsolatedAsyncioTestCase):
         text, _ = await self.plugin._wardrobe_command_payload(None, "u1", "查看")
         self.assertIn("套", text)
         self.assertIn("白衬衫黑纱裙（参考", text)
+
+
+class WardrobeReferenceIsolationTests(unittest.IsolatedAsyncioTestCase):
+    """参考（ownership=reference）只影响风格，绝不被她穿。"""
+
+    def setUp(self) -> None:
+        self.plugin = _WardrobeCommandHarness()
+
+    def _config_with_reference(self) -> None:
+        self.plugin.config["wardrobe_items"] = [
+            {"id": "w_owned", "name": "米色针织开衫", "slot": "upper", "ownership": "owned"},
+            {"id": "w_ref", "name": "博主同款外套", "slot": "upper", "ownership": "reference"},
+        ]
+        self.plugin.config["wardrobe_outfits"] = [
+            {"id": "o_owned", "name": "自有整套", "kind": "style", "style": "米色针织配长裤",
+             "ownership": "owned"},
+            {"id": "o_ref", "name": "参考整套", "kind": "style", "style": "暗黑白蕾丝层叠",
+             "ownership": "reference"},
+        ]
+
+    def test_selection_never_picks_a_reference_outfit(self) -> None:
+        self._config_with_reference()
+        result = self.plugin._wardrobe_outfit_selection(None)
+        self.assertEqual("自有整套", result["outfit_name"])
+
+    def test_reference_items_are_excluded_from_rule_selection(self) -> None:
+        self._config_with_reference()
+        names = {
+            row["name"]
+            for row in select_wardrobe_outfit(
+                self.plugin._wardrobe_owned_items(), [], seed="d1"
+            )["picked"]
+        }
+        self.assertIn("米色针织开衫", names)
+        self.assertNotIn("博主同款外套", names)
+
+    def test_reference_profile_line_is_injected_once_there_is_evidence(self) -> None:
+        self._config_with_reference()
+        self.plugin.config["wardrobe_outfits"] += [
+            {"name": "参考2", "kind": "style", "style": "白色蕾丝层叠连衣裙", "ownership": "reference"},
+            {"name": "参考3", "kind": "style", "style": "白色蕾丝蓬松半身裙", "ownership": "reference"},
+        ]
+        section = self.plugin._wardrobe_prompt_section(None)
+        assert section is not None
+        self.assertIn("参考风格（来自 3 套参考）", section.content)
+
+    def test_preview_exposes_reference_count_and_profile(self) -> None:
+        self._config_with_reference()
+        data = self.plugin._wardrobe_outfit_preview()
+        self.assertEqual(1, data["reference_count"])
+        self.assertEqual("", data["style_profile"])
+
+    def test_overview_marks_reference_outfits(self) -> None:
+        self._config_with_reference()
+        text = self.plugin._wardrobe_overview_text()
+        self.assertIn("参考整套（参考", text)

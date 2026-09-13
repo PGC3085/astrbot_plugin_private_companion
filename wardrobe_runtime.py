@@ -66,6 +66,7 @@ from .wardrobe import (
     wardrobe_summary_lines,
 )
 from .wardrobe_assets import ASSET_ORIGIN_BLOGGER, ASSET_ORIGIN_PANEL, import_asset
+from .wardrobe_style import render_reference_profile
 
 WARDROBE_PROMPT_KEY = "wardrobe.character"
 
@@ -147,6 +148,42 @@ class WardrobeMixin:
     def _wardrobe_outfits(self) -> list[dict[str, Any]]:
         return normalize_wardrobe_outfits(self._wardrobe_setting("wardrobe_outfits", []))
 
+    def _wardrobe_owned_items(self) -> list[dict[str, Any]]:
+        """Wearable items only：参考件（ownership=reference）不该被她穿。"""
+
+        return [
+            item
+            for item in self._wardrobe_items()
+            if str(item.get("ownership") or OWNERSHIP_OWNED) == OWNERSHIP_OWNED
+        ]
+
+    def _wardrobe_owned_outfits(self) -> list[dict[str, Any]]:
+        """Wearable outfits only：参考整套只影响风格，不参与"今天穿什么"。"""
+
+        return [
+            outfit
+            for outfit in self._wardrobe_outfits()
+            if str(outfit.get("ownership") or OWNERSHIP_OWNED) == OWNERSHIP_OWNED
+        ]
+
+    def _wardrobe_references(self) -> list[dict[str, Any]]:
+        """Reference looks：只用于归纳风格画像。"""
+
+        return [
+            dict(outfit)
+            for outfit in self._wardrobe_outfits()
+            if str(outfit.get("ownership") or "") == OWNERSHIP_REFERENCE
+        ]
+
+    def _wardrobe_reference_profile_line(self) -> str:
+        """One-line style profile mined from reference looks ("" when too few)."""
+
+        try:
+            return render_reference_profile(self._wardrobe_references())
+        except Exception as exc:
+            logger.debug("参考风格画像生成失败: %s", _single_line(exc, 160))
+            return ""
+
     def _wardrobe_outfit_mode(self) -> str:
         """Return inventory (列出全部衣物) or select (只注入裁决出的那一套)."""
 
@@ -202,8 +239,8 @@ class WardrobeMixin:
 
         seed = self._wardrobe_outfit_seed()
         return select_wardrobe_outfit(
-            self._wardrobe_items(),
-            self._wardrobe_outfits(),
+            self._wardrobe_owned_items(),
+            self._wardrobe_owned_outfits(),
             scene=self._wardrobe_current_scene(),
             seed=seed,
             rotation_days=self._wardrobe_outfit_rotation_days(),
@@ -357,6 +394,11 @@ class WardrobeMixin:
             )
         if not body:
             return None
+        # 参考风格画像：把大量参考压成一行，只在放得下时才追加
+        # （整套本身比风格画像重要，放不下就牺牲画像）。
+        profile_line = self._wardrobe_reference_profile_line()
+        if profile_line and len(body) + len(profile_line) + 1 <= WARDROBE_PROMPT_MAX_CHARS:
+            body = f"{body}\n{profile_line}"
         return prompt_section(
             key=WARDROBE_PROMPT_KEY,
             title="角色衣柜",
@@ -586,9 +628,21 @@ class WardrobeMixin:
         clean_seed = _single_line(seed, 160) or self._wardrobe_outfit_seed()
         mode = self._wardrobe_outfit_mode()
 
+        owned_items = [
+            item for item in items
+            if str(item.get("ownership") or OWNERSHIP_OWNED) == OWNERSHIP_OWNED
+        ]
+        owned_outfits = [
+            outfit for outfit in outfits
+            if str(outfit.get("ownership") or OWNERSHIP_OWNED) == OWNERSHIP_OWNED
+        ]
+        references = [
+            outfit for outfit in outfits
+            if str(outfit.get("ownership") or "") == OWNERSHIP_REFERENCE
+        ]
         selection = select_wardrobe_outfit(
-            items,
-            outfits,
+            owned_items,
+            owned_outfits,
             scene=clean_scene,
             seed=clean_seed,
             rotation_days=self._wardrobe_outfit_rotation_days(),
@@ -641,13 +695,15 @@ class WardrobeMixin:
             "seed": clean_seed,
             "item_count": len(items),
             "outfit_count": len(outfits),
+            "reference_count": len(references),
+            "style_profile": render_reference_profile(references),
             # 未分类的衣物没有部位可依据，正常不参与组合；数量暴露给面板，方便
             # 提示用户补全，而不是让他纳闷"为什么这几件从来不出现"。
             "unclassified_count": len(
                 [item for item in items if not str(item.get("slot") or "")]
             ),
             "request": build_wardrobe_outfit_request(
-                items,
+                owned_items,
                 outfits,
                 tendency=tendency,
                 scene=clean_scene,
