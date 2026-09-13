@@ -17,6 +17,8 @@ class PanelNavigationTests(unittest.TestCase):
         source = (ROOT / "pages/companion-panel/app.js").read_text(encoding="utf-8")
         start = source.index("function switchTab(")
         end = source.index("\nfunction ", start + 1)
+        guard_start = source.index("function companionPanelUnavailableReason(")
+        guard_end = source.index("\nfunction ", guard_start + 1)
         script = """
 const assert = require('node:assert/strict');
 const state = {activeTab: 'dashboard'};
@@ -27,12 +29,14 @@ const realityCompanionInstalled = () => false;
 const imageCompanionInstalled = () => false;
 const showToast = (...args) => notices.push(args);
 const hasUnsavedChanges = () => { throw new Error('guard must precede state or DOM mutations'); };
-""" + source[start:end] + """
-for (const tab of ['creative', 'reality', 'image', 'bookshelf', 'qzone']) {
+""" + source[guard_start:guard_end] + source[start:end] + """
+assert.equal(companionPanelUnavailableReason('memory'), '');
+assert.equal(companionPanelUnavailableReason('config'), '');
+for (const tab of ['creative', 'reality', 'image', 'bookshelf', 'qzone', 'enable_experimental_bluetooth_wakeup']) {
   switchTab(tab);
   assert.equal(state.activeTab, 'dashboard');
 }
-assert.equal(notices.length, 5);
+assert.equal(notices.length, 6);
 """
         result = subprocess.run([node, "-e", script], text=True, encoding="utf-8", capture_output=True)
         self.assertEqual(0, result.returncode, result.stderr)

@@ -34744,10 +34744,13 @@ input:checked + .rt2-switch-track.lg::after,
 /* Plugin task prompt workspace */
 .prompts-panel {
   min-width: 0;
+  container-name: prompt-page;
+  container-type: inline-size;
 }
 
 .prompts-page-head {
   align-items: flex-start;
+  flex-wrap: wrap;
 }
 
 .prompts-page-head .section-desc {
@@ -34894,10 +34897,18 @@ input:checked + .rt2-switch-track.lg::after,
 }
 
 .prompts-task-list {
-  min-height: 360px;
-  max-height: min(560px, calc(100vh - 390px));
+  min-height: 0;
+  max-height: clamp(220px, 48dvh, 560px);
   overflow-y: auto;
-  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.prompts-directory-hint {
+  margin: 0;
+  padding: 8px 14px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
 }
 
 .prompts-task-item {
@@ -34954,11 +34965,10 @@ input:checked + .rt2-switch-track.lg::after,
 
 .prompts-task-item code {
   min-width: 0;
-  overflow: hidden;
   color: var(--muted);
   font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .prompts-task-state {
@@ -35257,6 +35267,7 @@ input:checked + .rt2-switch-track.lg::after,
 
 .prompts-editor-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
@@ -35277,13 +35288,16 @@ input:checked + .rt2-switch-track.lg::after,
 }
 
 .prompts-editor-actions > div {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
 .prompts-editor-actions button {
   min-height: 38px;
+  max-width: 100%;
+  white-space: normal;
 }
 
 .prompts-editor-actions .danger-outline {
@@ -35399,6 +35413,52 @@ input:checked + .rt2-switch-track.lg::after,
   .prompts-group-nav button,
   .prompts-editor-actions button {
     transition: none;
+  }
+}
+
+/* Embedded plugin pages can be narrow even on a wide desktop screen. */
+@container prompt-page (max-width: 900px) {
+  .prompts-page-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .prompts-scope-note {
+    flex-basis: auto;
+    min-width: 0;
+  }
+
+  .prompts-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .prompts-catalog {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .prompts-task-list {
+    max-height: 310px;
+  }
+
+  .prompts-editor-head,
+  .prompts-builtin-preview-head {
+    flex-wrap: wrap;
+  }
+
+  .prompts-editor-meta {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .prompts-editor-meta > div + div {
+    border-top: 1px solid var(--line-soft);
+    border-left: 0;
+  }
+
+  #promptsEditor {
+    scroll-margin-top: 100px;
   }
 }
 
