@@ -114,6 +114,9 @@ async def handle_private_message(self: Any, event: Any, *args: Any, **kwargs: An
     if callable(inbound_checker) and not inbound_checker(event):
         logger.debug("非入站聊天事件跳过私聊陪伴链路")
         return
+    text = _single_line(event.message_str, 120)
+    if self._message_debounce_command_text(event, text):
+        return
     received_ts = _now_ts()
     user_id = str(event.get_sender_id())
     self_id = self._event_self_id(event)
@@ -121,7 +124,6 @@ async def handle_private_message(self: Any, event: Any, *args: Any, **kwargs: An
         logger.info("忽略 Bot 自己的私聊回流事件: user=%s", user_id)
         return
     sender_display_name = _single_line(self._sender_display_name(event), 40)
-    text = _single_line(event.message_str, 120)
     # Keep optional feedback/observation results defined when the message is
     # empty or exits through a lightweight branch.
     expression_feedback: dict[str, Any] = {}
@@ -155,10 +157,6 @@ async def handle_private_message(self: Any, event: Any, *args: Any, **kwargs: An
         logger.debug("私聊戳一戳 notice 交给专用插件")
         return
     self._qzone_note_event_bot(event)
-    if text.startswith(("陪伴", "/陪伴", "私聊陪伴", "主动陪伴")):
-        return
-    if self._message_debounce_command_text(event, text):
-        return
     existing_reply_preview = self._event_existing_reply_result_preview(event)
     if existing_reply_preview:
         preview_user_id = self._canonical_private_user_id(user_id)

@@ -58,6 +58,8 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform import PlatformStatus
 from astrbot.core.platform.platform_metadata import PlatformMetadata
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -3520,6 +3522,20 @@ class EventDispatchMixin:
     def _message_debounce_command_text(self, event: AstrMessageEvent, text: str) -> bool:
         """Command-like messages should not be delayed or merged as chat follow-ups."""
         if bool(getattr(event, "is_command", False)) or bool(getattr(event, "is_admin_command", False)):
+            return True
+        # AstrBot 会先移除唤醒前缀，且不一定设置 is_command。以已通过权限、
+        # 会话插件筛选的指令处理器为准；普通消息监听器也会出现在此列表中。
+        # 不重新执行 filter，避免改写框架已经解析好的参数。
+        extra_getter = getattr(event, "get_extra", None)
+        try:
+            handlers = extra_getter("activated_handlers") if callable(extra_getter) else None
+        except Exception:
+            handlers = None
+        if isinstance(handlers, (list, tuple)) and any(
+            isinstance(handler_filter, (CommandFilter, CommandGroupFilter))
+            for handler in handlers
+            for handler_filter in (getattr(handler, "event_filters", None) or ())
+        ):
             return True
         cleaned = _single_line(text, 260).strip()
         if not cleaned:

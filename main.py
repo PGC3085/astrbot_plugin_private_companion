@@ -20981,11 +20981,12 @@ class PrivateCompanionPlugin(
         return await handle_private_message(self, event, *args, **kwargs)
 
     async def _handle_private_message_preflight(self, event: AstrMessageEvent) -> bool:
-        feedback_handler = getattr(self, "_maybe_handle_wakeup_feedback", None)
         feedback_text = str(getattr(event, "message_str", "") or "")
-        is_companion_command = feedback_text.lstrip().startswith(("陪伴", "/陪伴", "私聊陪伴", "主动陪伴"))
+        if self._message_debounce_command_text(event, feedback_text):
+            return False
+        feedback_handler = getattr(self, "_maybe_handle_wakeup_feedback", None)
         pending_confirmation_handler = getattr(self, "_reality_touch_apply_pending_confirmation", None)
-        if callable(pending_confirmation_handler) and not is_companion_command:
+        if callable(pending_confirmation_handler):
             resolver = getattr(self, "_private_user_id_for_event", None)
             user_id = resolver(event) if callable(resolver) else str(event.get_sender_id() or "").strip()
             confirmation_reply = None
@@ -21029,7 +21030,7 @@ class PrivateCompanionPlugin(
                 await self._reply(event, confirmation_reply)
                 event.stop_event()
                 return True
-        if callable(feedback_handler) and not is_companion_command:
+        if callable(feedback_handler):
             raw_user_id = str(event.get_sender_id() or "").strip()
             normalizer = getattr(self, "_canonical_private_user_id", None)
             user_id = normalizer(raw_user_id) if callable(normalizer) else raw_user_id

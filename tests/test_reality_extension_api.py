@@ -181,6 +181,7 @@ class _PreflightRealityApi:
 class _PreflightHost(RealityCompanionBridgeMixin):
     # 直接读取插件类的契约常量：若插件侧丢失该常量，本文件在收集阶段即失败。
     _REALITY_TOUCH_CAMERA_CAPABILITY = PrivateCompanionPlugin._REALITY_TOUCH_CAMERA_CAPABILITY
+    _message_debounce_command_text = PrivateCompanionPlugin._message_debounce_command_text
 
     def __init__(self, api: _PreflightRealityApi) -> None:
         self.data = {"users": {"u": {"user_id": "u"}}}
