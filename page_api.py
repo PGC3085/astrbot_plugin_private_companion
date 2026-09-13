@@ -23297,6 +23297,7 @@ class PrivateCompanionPageApi(
             "wardrobe_image_prompt",
             "WARDROBE_VISION_PROVIDER_ID",
             "wardrobe_outfit_mode",
+            "wardrobe_injection_detail",
             "wardrobe_outfit_rotation_days",
             "enable_wardrobe_outfit_generate",
             "WARDROBE_OUTFIT_PROVIDER_ID",

@@ -2834,3 +2834,58 @@ class WardrobeDraftRoutingTests(unittest.TestCase):
         )
         self.assertFalse(outcome["ok"])
         self.assertTrue(outcome["limit"])
+
+
+class WardrobeProgressiveDisclosureTests(unittest.IsolatedAsyncioTestCase):
+    """渐进披露：默认每轮完整；progressive 时只常驻一行，问到才展开。"""
+
+    def setUp(self) -> None:
+        self.plugin = _WardrobeCommandHarness()
+        self.plugin.config["wardrobe_outfit_mode"] = "select"
+        self.plugin.config["wardrobe_items"] = [
+            {"name": "白色长袖衬衫", "slot": "upper"},
+            {"name": "黑色高腰纱裙", "slot": "lower"},
+        ]
+        self.plugin.config["wardrobe_outfits"] = [
+            {"name": "白衬衫黑纱裙", "kind": "style", "style": "白衬衫配黑色高腰纱裙与厚底玛丽珍鞋"},
+        ]
+
+    def test_default_mode_is_full(self) -> None:
+        self.assertEqual("full", self.plugin._wardrobe_injection_detail())
+        section = self.plugin._wardrobe_prompt_section(None, "今天天气不错")
+        assert section is not None
+        self.assertIn(WARDROBE_PROMPT_PREAMBLE, section.content)
+        self.assertIn("白衬衫配黑色高腰纱裙", section.content)
+
+    def test_progressive_without_trigger_injects_the_minimal_line(self) -> None:
+        self.plugin.config["wardrobe_injection_detail"] = "progressive"
+        section = self.plugin._wardrobe_prompt_section(None, "今天天气不错")
+        assert section is not None
+        self.assertIn("穿着（背景事实", section.content)
+        self.assertIn("白衬衫黑纱裙", section.content)
+        self.assertNotIn(WARDROBE_PROMPT_PREAMBLE, section.content)
+        self.assertLessEqual(len(section.content), 200)
+
+    def test_progressive_expands_when_the_user_asks_about_clothes(self) -> None:
+        self.plugin.config["wardrobe_injection_detail"] = "progressive"
+        section = self.plugin._wardrobe_prompt_section(None, "你今天穿的是什么呀")
+        assert section is not None
+        self.assertIn(WARDROBE_PROMPT_PREAMBLE, section.content)
+        self.assertGreater(len(section.content), 120)
+
+    def test_trigger_detection_is_keyword_based(self) -> None:
+        self.assertFalse(self.plugin._wardrobe_detail_triggered(""))
+        self.assertFalse(self.plugin._wardrobe_detail_triggered("晚饭吃什么"))
+        self.assertTrue(self.plugin._wardrobe_detail_triggered("外面冷，记得加外套"))
+        self.assertTrue(self.plugin._wardrobe_detail_triggered("让我看看你的 outfit"))
+
+    def test_unknown_detail_value_falls_back_to_full(self) -> None:
+        self.plugin.config["wardrobe_injection_detail"] = "乱填的值"
+        self.assertEqual("full", self.plugin._wardrobe_injection_detail())
+
+    def test_preview_reports_detail_mode_and_minimal(self) -> None:
+        self.plugin.config["wardrobe_injection_detail"] = "progressive"
+        data = self.plugin._wardrobe_outfit_preview()
+        self.assertEqual("progressive", data["detail_mode"])
+        self.assertIn("穿着（背景事实", data["minimal"])
+        self.assertLessEqual(len(data["minimal"]), data["minimal_limit"])

@@ -557,6 +557,12 @@ class PageSettingNormalizerMixin:
             return normalize_wardrobe_outfits(value)
         if key == "wardrobe_outfit_mode":
             return "select" if str(value or "").strip().casefold() == "select" else "inventory"
+        if key == "wardrobe_injection_detail":
+            return (
+                "progressive"
+                if str(value or "").strip().casefold() == "progressive"
+                else "full"
+            )
         if key == "wardrobe_outfit_rotation_days":
             return self._normalize_wardrobe_int(value, 7, 1, 30)
         if key == "wardrobe_tendency":

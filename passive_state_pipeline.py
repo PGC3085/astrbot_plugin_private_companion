@@ -811,7 +811,7 @@ async def inject_humanized_state(
     wardrobe_builder = getattr(self, "_wardrobe_prompt_section", None)
     if callable(wardrobe_builder):
         try:
-            wardrobe_section = wardrobe_builder(current_user)
+            wardrobe_section = wardrobe_builder(current_user, inbound_text)
         except Exception as exc:
             wardrobe_section = None
             logger.debug("角色衣柜提示词构建失败: %s", _single_line(exc, 160))

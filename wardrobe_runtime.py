@@ -71,6 +71,20 @@ from .wardrobe_style import render_reference_profile
 
 WARDROBE_PROMPT_KEY = "wardrobe.character"
 
+# 注入详略：full＝每轮都注入完整着装（原有行为）；
+# progressive＝常驻只给一行"今天穿什么"，细节等用户问到再展开。
+WARDROBE_DETAIL_FULL = "full"
+WARDROBE_DETAIL_PROGRESSIVE = "progressive"
+WARDROBE_MINIMAL_MAX_CHARS = 200
+
+# 触发词：命中才展开完整描述。让模型自己决定"要不要展开"不可预测，
+# 所以触发权收在关键词与命令上（架构 §风险：触发权）。
+_WARDROBE_DETAIL_TRIGGERS = (
+    "衣服", "穿着", "穿搭", "着装", "外套", "上衣", "衬衫", "毛衣", "卫衣", "开衫",
+    "裤子", "裙", "连衣裙", "鞋", "靴", "袜", "围巾", "帽子", "眼镜", "配饰", "包",
+    "打扮", "换装", "换衣", "衣柜", "好看吗", "穿什么", "今天穿", "outfit", "wear",
+)
+
 # 区分“没有这个值”和“值是 None”，回滚时据此决定是否写回。
 _MISSING = object()
 
@@ -184,6 +198,60 @@ class WardrobeMixin:
         except Exception as exc:
             logger.debug("参考风格画像生成失败: %s", _single_line(exc, 160))
             return ""
+
+    def _wardrobe_injection_detail(self) -> str:
+        """Return full (每轮完整) or progressive (常驻最小集 + 触发展开)."""
+
+        value = _single_line(
+            self._wardrobe_setting("wardrobe_injection_detail", WARDROBE_DETAIL_FULL), 20
+        ).casefold()
+        if value == WARDROBE_DETAIL_PROGRESSIVE:
+            return WARDROBE_DETAIL_PROGRESSIVE
+        return WARDROBE_DETAIL_FULL
+
+    @staticmethod
+    def _wardrobe_detail_triggered(text: Any) -> bool:
+        """True when the inbound message is actually about what she is wearing."""
+
+        haystack = _single_line(text, 400).casefold()
+        if not haystack:
+            return False
+        return any(word.casefold() in haystack for word in _WARDROBE_DETAIL_TRIGGERS)
+
+    def _wardrobe_minimal_body(self, user: Any = None, tendency: Any = "") -> str:
+        """常驻最小集：只够让模型知道"今天穿什么"，细节留给触发时展开。"""
+
+        head = "穿着（背景事实，不必主动提）："
+        parts: list[str] = []
+        if self._wardrobe_outfit_mode() == "select":
+            try:
+                selection = self._wardrobe_outfit_selection(user)
+            except Exception:
+                selection = {}
+            name = _single_line((selection or {}).get("outfit_name"), 24)
+            picked = [
+                _single_line(row.get("name"), 16)
+                for row in ((selection or {}).get("picked") or ())
+            ]
+            detail = "、".join(item for item in picked[:4] if item)
+            if name:
+                parts.append(f"今天穿「{name}」")
+            if detail:
+                parts.append(detail)
+        else:
+            clean_tendency = _single_line(tendency, 40)
+            if clean_tendency:
+                parts.append(f"整体倾向 {clean_tendency}")
+            count = len(self._wardrobe_owned_items())
+            if count:
+                parts.append(f"衣柜 {count} 件")
+        if not parts:
+            return ""
+        body = f"{head}{parts[0]}"
+        if len(parts) > 1:
+            body += "——" + parts[1]
+        body += "。" + chr(10) + "需要细节时再展开；不要复述衣物清单，也不要每轮都提。"
+        return body[:WARDROBE_MINIMAL_MAX_CHARS]
 
     def _wardrobe_outfit_mode(self) -> str:
         """Return inventory (列出全部衣物) or select (只注入裁决出的那一套)."""
@@ -374,8 +442,11 @@ class WardrobeMixin:
     # 提示词
     # ------------------------------------------------------------------
 
-    def _wardrobe_prompt_section(self, user: Any = None) -> PromptSection | None:
-        """Build the wardrobe prompt section, or ``None`` when it should not inject."""
+    def _wardrobe_prompt_section(self, user: Any = None, text: Any = "") -> PromptSection | None:
+        """Build the wardrobe prompt section, or ``None`` when it should not inject.
+
+        text 是本轮用户消息：渐进披露模式下用它判断"要不要展开完整描述"。
+        """
 
         if not self._wardrobe_enabled() or not self._wardrobe_prompt_mode():
             return None
@@ -384,7 +455,11 @@ class WardrobeMixin:
         outfits = self._wardrobe_outfits()
         if not tendency and not items and not outfits:
             return None
-        if self._wardrobe_outfit_mode() == "select":
+        progressive = self._wardrobe_injection_detail() == WARDROBE_DETAIL_PROGRESSIVE
+        if progressive and not self._wardrobe_detail_triggered(text):
+            # 常驻最小集：每轮都发，但很短；细节等触发。
+            body = self._wardrobe_minimal_body(user, tendency)
+        elif self._wardrobe_outfit_mode() == "select":
             body = self._wardrobe_selected_outfit_body(user, tendency)
         else:
             body = render_wardrobe_prompt(
@@ -723,6 +798,10 @@ class WardrobeMixin:
             "injected": injected,
             "injected_chars": len(injected),
             "injected_limit": WARDROBE_PROMPT_MAX_CHARS,
+            # 渐进披露对比：面板可以直接把"常驻最小集"与完整注入并排显示
+            "detail_mode": self._wardrobe_injection_detail(),
+            "minimal": self._wardrobe_minimal_body(None, tendency),
+            "minimal_limit": WARDROBE_MINIMAL_MAX_CHARS,
         }
 
     async def _append_group_wardrobe_to_request(self, event: Any, req: Any) -> None:
