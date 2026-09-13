@@ -21,6 +21,13 @@ from astrbot_plugin_private_companion.persona_config import (
 )
 from astrbot_plugin_private_companion.wardrobe import (
     DEFAULT_WARDROBE_IMAGE_PROMPT,
+    OWNERSHIP_OWNED,
+    OWNERSHIP_REFERENCE,
+    WARDROBE_IMAGE_KIND_ITEM,
+    WARDROBE_IMAGE_KIND_NONE,
+    WARDROBE_IMAGE_KIND_OUTFIT,
+    WARDROBE_IMAGE_KIND_REFERENCE,
+    WARDROBE_MAX_ASSET_IDS,
     OUTFIT_KIND_BUNDLE,
     OUTFIT_KIND_STYLE,
     PRECISION_EXACT,
@@ -63,6 +70,10 @@ from astrbot_plugin_private_companion.wardrobe import (
     normalize_wardrobe_items,
     normalize_wardrobe_outfit,
     normalize_wardrobe_outfits,
+    infer_wardrobe_slot,
+    normalize_asset_ids,
+    normalize_wardrobe_image_kind,
+    normalize_wardrobe_ownership,
     normalize_wardrobe_precision,
     normalize_wardrobe_slot,
     normalize_wardrobe_tags,
@@ -2495,3 +2506,126 @@ class WardrobePresetTests(unittest.TestCase):
         self.assertEqual({outfit["name"] for outfit in self.outfits}, seen)
         # 默认 7 天窗口正好把七套预设各穿一遍。
         self.assertEqual(len(set(first_week)), len(self.outfits), first_week)
+
+
+# ---------------------------------------------------------------------------
+# P. 识图两态：散件 / 整套 / 参考 / 无关
+# ---------------------------------------------------------------------------
+
+
+class WardrobeImageKindTests(unittest.TestCase):
+    """第一层分类决定入库去向，比描述本身更容易出错，所以要钉死。"""
+
+    def test_kind_aliases(self) -> None:
+        cases = {
+            "散件": WARDROBE_IMAGE_KIND_ITEM,
+            "单件": WARDROBE_IMAGE_KIND_ITEM,
+            "整套": WARDROBE_IMAGE_KIND_OUTFIT,
+            "全身": WARDROBE_IMAGE_KIND_OUTFIT,
+            "参考": WARDROBE_IMAGE_KIND_REFERENCE,
+            "灵感": WARDROBE_IMAGE_KIND_REFERENCE,
+            "无关": WARDROBE_IMAGE_KIND_NONE,
+            "无": WARDROBE_IMAGE_KIND_NONE,
+            "item": WARDROBE_IMAGE_KIND_ITEM,
+            "outfit": WARDROBE_IMAGE_KIND_OUTFIT,
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(expected, normalize_wardrobe_image_kind(raw), raw)
+
+    def test_unknown_kind_is_empty_not_a_guess(self) -> None:
+        for raw in ("", None, "看起来像衣服", 42):
+            self.assertEqual("", normalize_wardrobe_image_kind(raw), repr(raw))
+
+    def test_item_reply_keeps_slot_and_tags(self) -> None:
+        draft = parse_wardrobe_image_reply(
+            "类型：散件\n名称：米色针织开衫\n描述：细针织落肩版型\n部位：上身\n标签：居家|春秋"
+        )
+        assert draft is not None
+        self.assertEqual(WARDROBE_IMAGE_KIND_ITEM, draft["kind"])
+        self.assertEqual(SLOT_UPPER, draft["slot"])
+        self.assertEqual(["居家", "春秋"], draft["tags"])
+
+    def test_item_reply_without_slot_falls_back_to_name(self) -> None:
+        draft = parse_wardrobe_image_reply("类型：散件\n名称：深蓝牛仔裤\n描述：直筒微弹")
+        assert draft is not None
+        self.assertEqual(SLOT_LOWER, draft["slot"])
+
+    def test_outfit_reply_needs_no_slot(self) -> None:
+        draft = parse_wardrobe_image_reply(
+            "类型：整套\n名称：通勤正装\n描述：衬衫扎进长裤，配乐福鞋\n部位：\n标签：通勤"
+        )
+        assert draft is not None
+        self.assertEqual(WARDROBE_IMAGE_KIND_OUTFIT, draft["kind"])
+        self.assertEqual("", draft["slot"])
+
+    def test_none_reply_is_dropped(self) -> None:
+        self.assertIsNone(parse_wardrobe_image_reply("类型：无关"))
+        self.assertIsNone(parse_wardrobe_image_reply("无"))
+        self.assertIsNone(parse_wardrobe_image_reply(""))
+
+    def test_legacy_reply_without_kind_still_works(self) -> None:
+        # 旧提示词只有 名称/描述/标签：按散件处理，并从名称推断部位
+        draft = parse_wardrobe_image_reply("名称：碎花连衣裙\n描述：米白底小碎花及膝")
+        assert draft is not None
+        self.assertEqual(WARDROBE_IMAGE_KIND_ITEM, draft["kind"])
+        self.assertEqual(SLOT_WHOLE, draft["slot"])
+
+    def test_bullet_lines_are_not_swallowed_into_description(self) -> None:
+        draft = parse_wardrobe_image_reply(
+            "类型：散件\n  · 散件：单件衣物\n名称：白衬衫\n描述：挺括棉质"
+        )
+        assert draft is not None
+        self.assertNotIn("散件：单件衣物", draft["description"])
+
+    def test_slot_inference_table(self) -> None:
+        cases = {
+            "米色针织开衫": SLOT_UPPER,
+            "深蓝牛仔裤": SLOT_LOWER,
+            "白色帆布鞋": SLOT_FEET,
+            "细框眼镜": SLOT_EXTRA,
+            "碎花连衣裙": SLOT_WHOLE,
+            "白色棉质内衣": SLOT_UPPER,
+            "不明物体": "",
+        }
+        for name, expected in cases.items():
+            self.assertEqual(expected, infer_wardrobe_slot(name), name)
+
+
+class WardrobeAssetLinkTests(unittest.TestCase):
+    """素材引用与归属：架构上把"我拥有的"和"我喜欢的"分开的落点。"""
+
+    def test_asset_ids_normalized_and_capped(self) -> None:
+        self.assertEqual(["a", "b"], normalize_asset_ids("a, b、a"))
+        self.assertEqual([], normalize_asset_ids(None))
+        self.assertEqual(WARDROBE_MAX_ASSET_IDS, len(normalize_asset_ids([f"x{i}" for i in range(30)])))
+
+    def test_ownership_defaults_to_owned(self) -> None:
+        self.assertEqual(OWNERSHIP_OWNED, normalize_wardrobe_ownership(None))
+        self.assertEqual(OWNERSHIP_REFERENCE, normalize_wardrobe_ownership("参考"))
+        self.assertEqual(OWNERSHIP_REFERENCE, normalize_wardrobe_ownership("reference"))
+
+    def test_item_keeps_assets_and_ownership(self) -> None:
+        items, stored = add_wardrobe_item(
+            None, name="米色针织开衫", slot="upper", asset_ids=["asset_1"], ownership="reference"
+        )
+        self.assertEqual(["asset_1"], stored["asset_ids"])
+        self.assertEqual(OWNERSHIP_REFERENCE, stored["ownership"])
+        self.assertEqual(["asset_1"], normalize_wardrobe_item(items[0])["asset_ids"])
+
+    def test_re_describing_unions_assets(self) -> None:
+        items, _ = add_wardrobe_item(None, name="开衫", asset_ids=["asset_1"])
+        items, second = add_wardrobe_item(items, name="开衫", description="重新识图", asset_ids=["asset_2"])
+        self.assertEqual(["asset_1", "asset_2"], second["asset_ids"])
+
+    def test_outfit_keeps_assets_and_ownership(self) -> None:
+        outfits, stored = add_wardrobe_outfit(
+            None, name="白衬衫黑纱裙", kind="style", style="白衬衫配黑色纱裙",
+            asset_ids=["asset_9"], ownership="reference",
+        )
+        self.assertEqual(["asset_9"], stored["asset_ids"])
+        self.assertEqual(OWNERSHIP_REFERENCE, stored["ownership"])
+        self.assertEqual(["asset_9"], normalize_wardrobe_outfit(outfits[0])["asset_ids"])
+
+
+if __name__ == "__main__":
+    unittest.main()
