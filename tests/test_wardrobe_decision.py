@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import re
 import unittest
+from pathlib import Path
 
 from astrbot_plugin_private_companion.wardrobe import (
+    WARDROBE_MAX_ITEMS,
     normalize_wardrobe_items,
     render_wardrobe_block,
     select_wardrobe_outfit,
@@ -20,6 +22,7 @@ from astrbot_plugin_private_companion.wardrobe_decision import (
     DROP_REASON_BUDGET,
     DROP_REASON_LIMIT,
     DROP_REASON_OVERSIZE,
+    FAIRNESS_SCALE,
     PRIORITY_CLASSIFIED,
     PRIORITY_DESCRIBED,
     PRIORITY_FRESH,
@@ -29,6 +32,7 @@ from astrbot_plugin_private_companion.wardrobe_decision import (
     clean_score,
     entry_priority,
     entry_weight,
+    fair_priority,
     order_by_priority,
     order_by_weight,
     pack_entries,
@@ -37,6 +41,48 @@ from astrbot_plugin_private_companion.wardrobe_decision import (
 )
 
 NOTICE_PATTERN = re.compile("另有 ([0-9]+) 件未列出")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _slot_counts(block: str) -> dict[str, int]:
+    """数出块里每个部位各列了几件（标题行切换当前部位，条目行计数）。"""
+
+    counts: dict[str, int] = {}
+    current = ""
+    for line in block.split("\n"):
+        if line.startswith("── ") and line.endswith(" ──"):
+            current = line[3:-3].strip()
+            counts.setdefault(current, 0)
+        elif line.startswith("- ") and current:
+            counts[current] += 1
+    return counts
+
+
+def _preset_rows() -> list[dict]:
+    """开箱预设衣柜的原始条目（与 test_wardrobe.py 的 load_schema() 同一份数据）。"""
+
+    schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    return schema["wardrobe_config"]["items"]["wardrobe_items"]["default"]
+
+
+def _preset_items() -> list[dict]:
+    return normalize_wardrobe_items(_preset_rows())
+
+
+def _forty_items() -> list[dict]:
+    """把 19 件预设复制到条目上限：各部位 4 / 14 / 12 / 6 / 4，件数刻意不等。"""
+
+    rows = _preset_rows()
+    doubled: list[dict] = [dict(row) for row in rows]
+    for row in rows:
+        # 预设条目带显式 id：复制件必须改名并去掉 id，否则会被归一化当成重复项丢掉。
+        copy = dict(row)
+        copy.pop("id", None)
+        copy["name"] = f"{row['name']}·二"
+        doubled.append(copy)
+    doubled.append({"name": "补充上衣甲", "description": "额外的一件上装", "slot": "upper"})
+    doubled.append({"name": "补充上衣乙", "description": "另一件上装", "slot": "upper"})
+    return normalize_wardrobe_items(doubled)
 
 
 def _entry(key, *, priority=0, weight=0, length=1, group=""):
@@ -163,6 +209,53 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(["b", "a"], _keys(ordered))
         ordered = order_by_weight(rows, weight_of=lambda row: {"a": 2, "b": 1}[row["key"]])
         self.assertEqual(["b", "a"], _keys(ordered))
+
+
+class FairPriorityTests(unittest.TestCase):
+    """公平轮：tier 仍然绝对优先，同 tier 才按"本部位第几件"轮转。
+
+    这是"预算收紧时整段部位被饿死"的修复：同 tier 内所有部位的"第 0 件"排在
+    所有"第 1 件"前面，贪心装箱于是退化成轮转，预算被均匀铺到各部位。
+    """
+
+    def test_a_higher_tier_wins_even_at_the_worst_rank(self) -> None:
+        self.assertGreater(fair_priority(2, FAIRNESS_SCALE - 1), fair_priority(1, 0))
+
+    def test_lower_rank_wins_inside_the_same_tier(self) -> None:
+        self.assertGreater(fair_priority(3, 0), fair_priority(3, 1))
+        self.assertEqual(3 * FAIRNESS_SCALE - 2, fair_priority(3, 2))
+
+    def test_scale_must_exceed_the_largest_possible_rank(self) -> None:
+        # 衣柜条目上限就是最大可能序号 + 1；scale 留足余量，序号才撑不破 tier。
+        self.assertGreater(FAIRNESS_SCALE, WARDROBE_MAX_ITEMS)
+
+    def test_rank_is_clamped_so_it_never_pierces_the_tier(self) -> None:
+        self.assertGreater(fair_priority(1, 10_000), fair_priority(0, 0))
+        self.assertEqual(fair_priority(1, FAIRNESS_SCALE - 1), fair_priority(1, 10_000))
+        self.assertEqual(fair_priority(1, 0), fair_priority(1, -5))
+
+    def test_illegal_scale_falls_back_to_the_default(self) -> None:
+        self.assertEqual(fair_priority(2, 1), fair_priority(2, 1, scale=0))
+        self.assertEqual(fair_priority(2, 1), fair_priority(2, 1, scale="不是数字"))
+
+    def test_garbage_inputs_fall_back(self) -> None:
+        self.assertEqual(fair_priority(1, 0), fair_priority(1, None))
+        self.assertEqual(fair_priority(0, 0), fair_priority("不是数字", "也不是"))
+
+    def test_round_robin_order_visits_every_slot_before_any_second_item(self) -> None:
+        # 三个部位、件数 3 / 2 / 1：顺序是 上0 下0 鞋0 上1 下1 上2。
+        rows = [
+            {"key": "上0", "priority": fair_priority(1, 0)},
+            {"key": "上1", "priority": fair_priority(1, 1)},
+            {"key": "上2", "priority": fair_priority(1, 2)},
+            {"key": "下0", "priority": fair_priority(1, 0)},
+            {"key": "下1", "priority": fair_priority(1, 1)},
+            {"key": "鞋0", "priority": fair_priority(1, 0)},
+        ]
+        self.assertEqual(
+            ["上0", "下0", "鞋0", "上1", "下1", "上2"],
+            [row["key"] for row in order_by_priority(rows)],
+        )
 
 
 class PackTests(unittest.TestCase):
@@ -390,7 +483,10 @@ class RenderIntegrationTests(unittest.TestCase):
         self.assertNotIn("开衫甲", block)
         self.assertIn("另有 1 件未列出", block)
 
-    def test_intimate_items_outrank_bare_ones_at_the_same_level(self) -> None:
+    def test_intimate_marker_is_rendered_without_jumping_the_queue(self) -> None:
+        # 贴身件照旧打标记，但不额外吃渲染优先级：给它加一档会让它跳到所有部位的
+        # 第 0 件之前，把轮转打破（实测预设衣柜 cap=300 时变成上身 3 件，而整身 /
+        # 足部 / 配件各 1 件，极差 2）。贴身轴属于散件**选择**路径，不是渲染预算。
         items = normalize_wardrobe_items(
             [
                 {"name": "开衫甲", "slot": "upper"},
@@ -398,8 +494,10 @@ class RenderIntegrationTests(unittest.TestCase):
             ]
         )
         block = render_wardrobe_block("", items, max_items=1, max_chars=2000)
-        self.assertIn("白色内衣", block)
-        self.assertNotIn("开衫甲", block)
+        self.assertIn("开衫甲", block)
+        self.assertNotIn("白色内衣", block)
+        # 两件都列出来时贴身标记仍然在（只是不参与抢预算）。
+        self.assertIn("白色内衣（贴身）", render_wardrobe_block("", items, max_chars=2000))
 
     def test_notice_counts_every_dropped_item_and_the_budget_holds(self) -> None:
         items = normalize_wardrobe_items(
@@ -434,6 +532,53 @@ class RenderIntegrationTests(unittest.TestCase):
         match = NOTICE_PATTERN.search(block)
         self.assertIsNotNone(match)
         self.assertEqual(len(items), block.count("\n- ") + int(match.group(1)))
+
+
+class RenderFairnessTests(unittest.TestCase):
+    """预算或条数收紧时不能把整段部位饿死：同 tier 内按部位轮转。"""
+
+    def _assert_fair_block(self, block: str, items: list[dict], *, budget: int) -> dict[str, int]:
+        counts = _slot_counts(block)
+        self.assertEqual(5, len(counts), counts)
+        self.assertTrue(all(count >= 1 for count in counts.values()), counts)
+        # 轮转的直接推论：各部位保留件数极差不超过 1。
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1, counts)
+        self.assertLessEqual(len(block), budget)
+        listed = block.count("\n- ")
+        match = NOTICE_PATTERN.search(block)
+        self.assertIsNotNone(match, block)
+        self.assertEqual(len(items), listed + int(match.group(1)))
+        return counts
+
+    def test_preset_wardrobe_at_a_tight_character_budget(self) -> None:
+        # 数据点一：19 件预设 / cap=300。修复前是 上身 6、下身 3、整身/足部/配件 0。
+        items = _preset_items()
+        block = render_wardrobe_block("偏爱宽松针织", items, max_items=20, max_chars=300)
+        counts = self._assert_fair_block(block, items, budget=300)
+        self.assertGreaterEqual(sum(counts.values()), 5, counts)
+
+    def test_item_cap_spreads_across_slots_as_well(self) -> None:
+        # 数据点二：40 件 / max_items=20 / cap=900 —— 这里卡住的是条数上限而不是
+        # 字符预算。两条路径共用同一个排序，所以公平性必须同样成立（上限 20 件、
+        # 5 个部位 ⇒ 每部位 4 件；修复前是 整身 2、上身 7、下身 7、足部 3、配件 1）。
+        items = _forty_items()
+        self.assertEqual(40, len(items))
+        block = render_wardrobe_block("偏爱宽松针织", items, max_items=20, max_chars=900)
+        counts = self._assert_fair_block(block, items, budget=900)
+        self.assertEqual(20, sum(counts.values()), counts)
+
+    def test_a_single_item_slot_is_never_starved(self) -> None:
+        # 只有一件的部位在第 0 轮就该进来，不能因为别的部位件多而永远轮不到。
+        items = normalize_wardrobe_items(
+            [
+                {"name": f"上衣{index}", "description": "宽松版型", "slot": "upper"}
+                for index in range(6)
+            ]
+            + [{"name": "唯一的鞋", "description": "低帮", "slot": "feet"}]
+        )
+        block = render_wardrobe_block("", items, max_items=2, max_chars=900)
+        self.assertIn("唯一的鞋", block)
+        self.assertEqual(2, block.count("\n- "))
 
 
 class SelectionIntegrationTests(unittest.TestCase):
