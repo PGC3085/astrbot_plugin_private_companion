@@ -341,6 +341,7 @@ from .message_pipeline import (
     handle_group_message,
     handle_private_message,
 )
+from .wake_message_context import capture_wake_message_context, restore_wake_message_request
 from .tool_history_sanitizer import sanitize_history_image_blocks, sanitize_openai_tool_history
 from .forward_message import ForwardMessageMixin
 from .private_image import PrivateImageMixin
@@ -8992,6 +8993,28 @@ class PrivateCompanionPlugin(
                     persona_id,
                     snapshot,
                 )
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=230000)
+    async def preserve_addressed_user_message(self, event: AstrMessageEvent, *args, **kwargs):
+        """Keep the original chat wording separately from the command-routing text."""
+        if (
+            self is None or not _plugin_instance_can_dispatch(self)
+            or not self.enabled or not self._bot_scope_allows_event(event)
+        ):
+            return
+        capture_wake_message_context(self, event)
+
+    @filter.on_llm_request(priority=230000)
+    async def restore_addressed_user_request(
+        self, event: AstrMessageEvent, req: ProviderRequest, *args, **kwargs,
+    ):
+        """Restore addressed chat before state enrichment and MemoryCompanion run."""
+        if (
+            self is None or not _plugin_instance_can_dispatch(self)
+            or not self.enabled or not self._bot_scope_allows_event(event)
+        ):
+            return
+        restore_wake_message_request(self, event, req)
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=11000)
     @_multi_persona_event_context
@@ -20781,7 +20804,8 @@ class PrivateCompanionPlugin(
                     f"当前人格已重置：{persona_label}\n"
                     f"人格资料代次：第 {generation} 代\n"
                     "插件基础配置、多人格列表和窗口绑定均已保留。\n"
-                    "重置前资料已保存到 persona_backups。AstrBot 会话历史和外部长期记忆不在本次重置范围内。"
+                    "重置前资料已保存到 persona_backups。同步到 MemoryCompanion 的当前人格分域投影会一并清理；"
+                    "AstrBot 会话历史和 MemoryCompanion 自主管理的其他长期记忆不受影响。"
                 )
                 if rebuild_error:
                     message += f"\n今日状态与日程自动重建失败：{rebuild_error}"
