@@ -78,6 +78,7 @@ PRIORITY_INTIMATE = 5
 # weight 的档位间距：留出在两档之间插一档的空间（例如给"外套"单独一档）。
 WEIGHT_STEP = 10
 
+
 # 同 tier 内"公平轮"的放大系数：必须大于任何部位可能的最大序号，否则序号会顶穿
 # tier，让件多的部位反过来压过更高一等的条目。衣柜条目上限 40（wardrobe.py 的
 # WARDROBE_MAX_ITEMS），取 100 留足余量。
@@ -195,6 +196,12 @@ def fair_priority(tier: Any, rank: Any, *, scale: int = FAIRNESS_SCALE) -> int:
 
     rank 超出 `scale` 时夹到 `scale - 1`：宁可让它们同分（退回输入顺序），
     也不能顶穿 tier；负数 rank 按 0 处理。
+
+    注意：**不要**再往这个公式里塞第三个维度（例如"部位必要性"）。rank 一旦乘上
+    额外步长，`rank * 步长` 就可能超过 `scale`，把 tier 之间的隔离顶穿 —— 而 tier
+    隔离是这个函数的唯一硬保证。要让同一轮内部按别的顺序排，应该在调用方**预先
+    按那个顺序排好候选列表**：pack_entries 的同分排序是稳定排序，输入顺序就是
+    同分时的先后（渲染层就是这么处理"必要性"的）。
     """
 
     span = clean_score(scale, FAIRNESS_SCALE)

@@ -942,6 +942,76 @@ def _wardrobe_notice(count: int) -> str:
     return f"（另有 {count} 件未列出）"
 
 
+# 部位的必要性：数值小 = 预算不够时更不该被牺牲。它与 _RENDER_SLOT_ORDER 当前同序，
+# 但是**独立的轴** —— 渲染顺序回答「写在哪一行」，必要性回答「名额不够先砍谁」。
+#
+# 它**不进 priority 公式**，而是用来预先排列候选列表：pack_entries 的同分排序是
+# 稳定排序，同 tier 同轮次时输入顺序就是先后。把必要性做成第三维乘进 priority
+# 会顶穿 tier 隔离（见 wardrobe_decision.fair_priority 的说明），得不偿失。
+_SLOT_NECESSITY = {
+    SLOT_WHOLE: 0,
+    SLOT_UPPER: 1,
+    SLOT_LOWER: 2,
+    SLOT_FEET: 3,
+    SLOT_EXTRA: 4,
+    "": 5,
+}
+
+# 每部位能占多少**条数**：先给每个部位保底 QUOTA_BASE 件，余量按这张权重表分。
+# 上装/下装是搭配的骨架，整身与鞋次之，配件最次，未分类按配件算。
+# 权重只按「在场部位」归一化 —— 某个部位一件都没有时它不占份额，份额自动让给别人。
+_SLOT_QUOTA_WEIGHTS = {
+    SLOT_UPPER: 3,
+    SLOT_LOWER: 3,
+    SLOT_WHOLE: 2,
+    SLOT_FEET: 2,
+    SLOT_EXTRA: 1,
+    "": 1,
+}
+# 每个部位的保底名额：任何部位（只要它真的有件）至少能进这么多件，
+# 剩下的名额再按上面的权重分。
+QUOTA_BASE = 1
+
+
+def _wardrobe_slot_quotas(totals: Mapping[str, int], max_items: Any) -> dict[str, int]:
+    """每个部位最多能有几件进提示词（硬上限，只用于**封顶**不是预留）。
+
+    没有它的话，轮转只保证「每部位都有份」，但轮转是**按部位平分件数**的：
+    20 件配饰 + 2 件上衣的衣柜，配饰照样能占掉 16/20 个条数名额（实测），
+    因为别的部位挑完之后剩下的名额全归了它。配额把这种偏斜按必要性压回去。
+
+    - 保底 QUOTA_BASE：件少的部位不会因为权重低而被压到看不见（谁都不为零）；
+    - 上界取 min(配额, 该部位实际件数)：件数本来就少的不受影响；
+    - max_items <= 0（不限制条数）时只按实际件数走，等于不封顶。
+    """
+
+    try:
+        clean_limit = max(0, int(max_items))
+    except (TypeError, ValueError):
+        clean_limit = 0
+    present = {
+        str(slot): int(count)
+        for slot, count in (totals or {}).items()
+        if isinstance(count, int) and count > 0
+    }
+    if not present:
+        return {}
+    if clean_limit <= 0:
+        # 不限制条数时等于不封顶：只按实际件数走。
+        return {slot: count for slot, count in present.items()}
+    total_weight = sum(_SLOT_QUOTA_WEIGHTS.get(slot, 1) for slot in present) or 1
+    # 先给每个部位保底 QUOTA_BASE 件，剩下的名额按必要性权重分配：上装/下装拿得多，
+    # 配件拿得少，但谁都不会一件不留。配额只是**封顶**，不是预留 —— 件数本来就
+    # 低于配额的部位完全不受影响，所以均衡衣柜的行为与加配额之前逐字一致。
+    remaining = max(0, clean_limit - QUOTA_BASE * len(present))
+    quotas: dict[str, int] = {}
+    for slot, count in present.items():
+        weight = _SLOT_QUOTA_WEIGHTS.get(slot, 1)
+        share = -(-remaining * weight // total_weight)  # 向上取整
+        quotas[slot] = max(1, min(QUOTA_BASE + share, count))
+    return quotas
+
+
 def _render_candidate(item: Mapping[str, Any], *, slot_index: int = 0) -> dict[str, Any]:
     """把一个衣物条目打成装箱候选：渲染行 + priority + weight。
 
@@ -951,6 +1021,10 @@ def _render_candidate(item: Mapping[str, Any], *, slot_index: int = 0) -> dict[s
     `slot_index` 是这件衣物在**自己部位内**的序号（0 起），用于 priority 的
     次级排序键：同 tier 时所有部位的"第 0 件"先被收下，再轮到各自的"第 1 件"……
     否则件多又靠前的部位（例如上身）会把预算吃光，鞋和配件一件不剩。
+
+    预算连「每部位一件」都装不下时谁先被牺牲，由候选列表的**输入顺序**决定：
+    调用方会先按 _SLOT_NECESSITY 稳定排序，于是先砍配件而不是「配置里恰好排在
+    最后的那一件」。
     """
 
     slot = str(item.get("slot") or "")
@@ -1018,19 +1092,42 @@ def render_wardrobe_block(
     lines.append("衣柜里的具体衣物：")
     # 部位内序号按衣柜里的原始顺序数（0 起），它是装箱时的轮转次级键。
     slot_cursor: dict[str, int] = {}
+    slot_totals: dict[str, int] = {}
     candidates: list[dict[str, Any]] = []
     for item in normalized:
         slot = str(item.get("slot") or "")
         index = slot_cursor.get(slot, 0)
         slot_cursor[slot] = index + 1
+        slot_totals[slot] = slot_totals.get(slot, 0) + 1
         candidates.append(_render_candidate(item, slot_index=index))
+    # 部位配额是**硬上限**：先按必要性把条数分给各部位，超出的直接不进装箱。
+    # 没有它，偏斜衣柜（例如 20 件配饰 + 2 件上衣）里配饰会吃掉绝大部分名额 ——
+    # 轮转只保证每部位都有份，不限制份额。
+    quotas = _wardrobe_slot_quotas(slot_totals, max_items)
+    bucketed: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        bucketed.setdefault(candidate["slot"], []).append(candidate)
+    admitted: list[dict[str, Any]] = []
+    for slot, rows in bucketed.items():
+        # 配额在同部位内部按 priority 取前 N：有描述的排在没描述的前面，所以被砍掉的
+        # 是「信息量最小」的那几件，而不是「配置里排在最后」的。稳定排序保证同分时
+        # 仍是衣柜原始顺序。
+        quota = quotas.get(slot, len(rows))
+        admitted.extend(sorted(rows, key=lambda row: -row["priority"])[:quota])
+    # 同 tier 同轮次的候选之间靠「输入顺序」分先后（pack_entries 用稳定排序），
+    # 所以最后按部位必要性稳定排一遍：预算连「每部位一件」都装不下时先牺牲配件，
+    # 而不是「配置里恰好排在最后的那一件」。
+    admitted.sort(
+        key=lambda candidate: _SLOT_NECESSITY.get(candidate["slot"], len(_SLOT_NECESSITY))
+    )
+    quota_dropped = len(candidates) - len(admitted)
     # 每条候选按「正文 + 换行」计价，而最后一行没有换行，所以可用额度比 max_chars 多 1。
     available = max_chars + 1 - sum(len(line) + 1 for line in lines)
     group_cost = {slot: len(_slot_header(slot)) + 1 for slot in _RENDER_SLOT_ORDER}
 
     def _pack(budget: int) -> dict[str, Any]:
         return pack_entries(
-            candidates,
+            admitted,
             budget=budget,
             measure=lambda candidate: len(candidate["line"]) + 1,
             group_of=lambda candidate: candidate["slot"],
@@ -1039,10 +1136,12 @@ def render_wardrobe_block(
         )
 
     packed = _pack(available)
-    if packed["dropped_count"]:
+    dropped_total = packed["dropped_count"] + quota_dropped
+    if dropped_total:
         # 只有真丢了才发那行提示，所以先按不预留跑一趟；真丢了再把提示长度扣掉
         # 重跑一趟。预留宽度按"最多可能丢的件数"算，第二趟即使丢得更多也放得下。
         packed = _pack(available - len(_wardrobe_notice(len(candidates))) - 1)
+        dropped_total = packed["dropped_count"] + quota_dropped
     emitted_slots: set[str] = set()
     for candidate in packed["kept"]:
         slot = candidate["slot"]
@@ -1050,8 +1149,8 @@ def render_wardrobe_block(
             emitted_slots.add(slot)
             lines.append(_slot_header(slot))
         lines.append(candidate["line"])
-    if packed["dropped_count"]:
-        lines.append(_wardrobe_notice(packed["dropped_count"]))
+    if dropped_total:
+        lines.append(_wardrobe_notice(dropped_total))
     return _truncate_block("\n".join(lines), max_chars)
 
 

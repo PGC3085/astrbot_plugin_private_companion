@@ -14,6 +14,8 @@ from pathlib import Path
 
 from astrbot_plugin_private_companion.wardrobe import (
     WARDROBE_MAX_ITEMS,
+    WARDROBE_SLOT_LABELS,
+    _wardrobe_slot_quotas,
     normalize_wardrobe_items,
     render_wardrobe_block,
     select_wardrobe_outfit,
@@ -559,13 +561,52 @@ class RenderFairnessTests(unittest.TestCase):
 
     def test_item_cap_spreads_across_slots_as_well(self) -> None:
         # 数据点二：40 件 / max_items=20 / cap=900 —— 这里卡住的是条数上限而不是
-        # 字符预算。两条路径共用同一个排序，所以公平性必须同样成立（上限 20 件、
-        # 5 个部位 ⇒ 每部位 4 件；修复前是 整身 2、上身 7、下身 7、足部 3、配件 1）。
+        # 字符预算（修复前是 整身 2、上身 7、下身 7、足部 3、配件 1）。
+        #
+        # 加了部位配额之后，这里**不再**要求"各部位件数相等"：配额会按必要性把
+        # 配件封顶，省下来的名额让给上装/下装，所以实测是 4 / 5 / 4 / 4 / 3。
+        # 该守的性质变成两条：谁都不为零，谁都不超配额。
         items = _forty_items()
         self.assertEqual(40, len(items))
         block = render_wardrobe_block("偏爱宽松针织", items, max_items=20, max_chars=900)
-        counts = self._assert_fair_block(block, items, budget=900)
+        counts = _slot_counts(block)
+        self.assertEqual(5, len(counts), counts)
+        self.assertTrue(all(count >= 1 for count in counts.values()), counts)
+        self.assertLessEqual(len(block), 900)
         self.assertEqual(20, sum(counts.values()), counts)
+        totals: dict[str, int] = {}
+        for item in items:
+            slot = str(item.get("slot") or "")
+            totals[slot] = totals.get(slot, 0) + 1
+        quotas = _wardrobe_slot_quotas(totals, 20)
+        for slot, quota in quotas.items():
+            self.assertLessEqual(counts[WARDROBE_SLOT_LABELS[slot]], quota, (slot, counts))
+        match = NOTICE_PATTERN.search(block)
+        self.assertIsNotNone(match, block)
+        self.assertEqual(len(items), block.count("\n- ") + int(match.group(1)))
+
+    def test_accessories_cannot_monopolize_the_item_cap(self) -> None:
+        # 偏斜衣柜：20 件配件 + 2 件上衣 + 2 件下装。轮转只保证"每部位都有份"，
+        # 不限制份额 —— 没有配额时别的部位挑完，剩下的条数名额全归配件（实测 16/20，
+        # 提示词里 80% 是配饰）。配额把这种偏斜按必要性压回去。
+        items = normalize_wardrobe_items(
+            [
+                {"name": f"饰品{index}", "description": "小配饰", "slot": "extra"}
+                for index in range(20)
+            ]
+            + [
+                {"name": "上衣甲", "description": "上装", "slot": "upper"},
+                {"name": "上衣乙", "description": "上装", "slot": "upper"},
+                {"name": "长裤甲", "description": "下装", "slot": "lower"},
+                {"name": "长裤乙", "description": "下装", "slot": "lower"},
+            ]
+        )
+        self.assertEqual(24, len(items))
+        block = render_wardrobe_block("", items, max_items=20, max_chars=900)
+        self.assertEqual({"上身": 2, "下身": 2, "配件": 4}, _slot_counts(block), block)
+        match = NOTICE_PATTERN.search(block)
+        self.assertIsNotNone(match, block)
+        self.assertEqual(len(items), block.count("\n- ") + int(match.group(1)))
 
     def test_a_single_item_slot_is_never_starved(self) -> None:
         # 只有一件的部位在第 0 轮就该进来，不能因为别的部位件多而永远轮不到。
