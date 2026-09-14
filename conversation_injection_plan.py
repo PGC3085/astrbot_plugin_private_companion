@@ -39,6 +39,7 @@ TURN_FRAGMENTS_ATTR = "_private_companion_turn_prompt_fragments"
 TURN_PLACEMENT_ATTR = "_private_companion_turn_prompt_placement"
 TURN_PART_ATTR = "_private_companion_turn_fragments"
 TURN_TEXT_ATTR = "_private_companion_conversation_plan_turn_text"
+TURN_BASE_OVERRIDE_ATTR = "_private_companion_conversation_plan_turn_base_override"
 DELIVERY_GROUP_MARKER_METADATA_KEY = "delivery_group_marker"
 
 PLACEMENT_STABLE_SYSTEM = "stable_system"
@@ -533,14 +534,20 @@ class ConversationInjectionPlan:
         parts = getattr(req, "extra_user_content_parts", None)
         if not isinstance(parts, list):
             return
-        kept: list[Any] = []
-        for part in parts:
-            if bool(getattr(part, TURN_PART_ATTR, False)):
-                continue
-            kept.append(part)
-        req.extra_user_content_parts = kept
+        parts[:] = [
+            part
+            for part in parts
+            if not bool(getattr(part, TURN_PART_ATTR, False))
+        ]
 
     def _base_prompt(self, req: Any) -> str:
+        override = getattr(req, TURN_BASE_OVERRIDE_ATTR, _MISSING)
+        if override is not _MISSING:
+            try:
+                delattr(req, TURN_BASE_OVERRIDE_ATTR)
+            except (AttributeError, TypeError):
+                pass
+            return str(override or "").strip()
         current = str(getattr(req, "prompt", "") or "")
         previous = str(getattr(req, TURN_TEXT_ATTR, "") or "")
         if previous:
@@ -631,6 +638,18 @@ def get_conversation_injection_plan(req: Any, *, create: bool = True) -> Convers
     return plan
 
 
+def replace_conversation_turn_prompt(req: Any, prompt: str) -> bool:
+    """Replace the request's user-authored turn text through the canonical renderer."""
+    if req is None or not isinstance(prompt, str):
+        return False
+    plan = get_conversation_injection_plan(req)
+    if plan is None:
+        return False
+    setattr(req, TURN_BASE_OVERRIDE_ATTR, prompt)
+    plan.render_into(req)
+    return True
+
+
 __all__ = [
     "ConversationInjectionBlock",
     "ConversationInjectionPlan",
@@ -641,4 +660,5 @@ __all__ = [
     "PLACEMENT_TURN_TAIL",
     "PLAN_ATTR",
     "get_conversation_injection_plan",
+    "replace_conversation_turn_prompt",
 ]

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .conversation_injection_plan import replace_conversation_turn_prompt
+
 
 WAKE_MESSAGE_CONTEXT_ATTR = "_private_companion_wake_message_context"
 
@@ -83,8 +85,7 @@ def restore_wake_message_request(owner: Any, event: Any, req: Any) -> bool:
     if not isinstance(prompt, str):
         return False
     if prompt.strip() == routed:
-        req.prompt = original
-        return True
+        return replace_conversation_turn_prompt(req, original)
     settings = _event_config(owner, event).get("provider_settings", {})
     prefix = settings.get("prompt_prefix") if isinstance(settings, Mapping) else None
     if isinstance(prefix, str) and prefix:
@@ -92,6 +93,5 @@ def restore_wake_message_request(owner: Any, event: Any, req: Any) -> bool:
             return prefix.replace("{{prompt}}", text) if "{{prompt}}" in prefix else prefix + text
 
         if prompt.strip() == decorate(routed).strip():
-            req.prompt = decorate(original)
-            return True
+            return replace_conversation_turn_prompt(req, decorate(original))
     return False
