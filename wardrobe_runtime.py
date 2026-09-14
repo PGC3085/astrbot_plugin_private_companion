@@ -16,7 +16,8 @@ import asyncio
 import hashlib
 import json
 from copy import deepcopy
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -30,14 +31,19 @@ from .wardrobe import (
     OWNERSHIP_OWNED,
     OWNERSHIP_REFERENCE,
     WARDROBE_IMAGE_KIND_ITEM,
+    WARDROBE_IMAGE_KIND_NONE,
     WARDROBE_IMAGE_KIND_OUTFIT,
     WARDROBE_IMAGE_KIND_REFERENCE,
     SOURCE_KIND_IMAGE,
     SOURCE_KIND_MANUAL,
+    WARDROBE_MAX_DESCRIPTION,
     WARDROBE_MAX_ITEMS,
+    WARDROBE_MAX_NAME,
     WARDROBE_MAX_OUTFITS,
+    WARDROBE_MAX_TAG,
     WARDROBE_PROMPT_MAX_CHARS,
     WARDROBE_PROMPT_MAX_ITEMS,
+    WARDROBE_SLOT_LABELS,
     WardrobeError,
     WardrobeLimitError,
     add_wardrobe_item,
@@ -66,7 +72,23 @@ from .wardrobe import (
     update_wardrobe_outfit,
     wardrobe_summary_lines,
 )
-from .wardrobe_assets import ASSET_ORIGIN_BLOGGER, ASSET_ORIGIN_PANEL, import_asset
+from .wardrobe_assets import (
+    ASSET_ORIGIN_BLOGGER,
+    ASSET_ORIGIN_LOCAL,
+    ASSET_ORIGIN_PANEL,
+    ASSET_ORIGIN_SCREENSHOT,
+    ASSET_ORIGIN_SHARE_TEXT,
+    ASSET_ORIGIN_TAOBAO,
+    ASSET_STATUS_IMPORTED,
+    ASSET_STATUS_REJECTED,
+    ASSET_STATUS_UNDERSTOOD,
+    asset_abs_path,
+    import_asset,
+    list_pending_drafts,
+    load_asset_draft,
+    load_asset_index,
+    mark_asset_status,
+)
 from .wardrobe_style import render_reference_profile
 
 WARDROBE_PROMPT_KEY = "wardrobe.character"
@@ -91,6 +113,26 @@ _MISSING = object()
 # 识图可能较慢；衣柜是显式命令触发的交互，可以等得久一点。
 _WARDROBE_VISION_TIMEOUT_SECONDS = 90.0
 _WARDROBE_VISION_MAX_IMAGES = 8
+
+# 草稿队列：面板要显示人话，标签映射收在后端一份，别让前端各写一套。
+WARDROBE_DRAFT_KIND_LABELS: dict[str, str] = {
+    WARDROBE_IMAGE_KIND_ITEM: "散件",
+    WARDROBE_IMAGE_KIND_OUTFIT: "整套",
+    WARDROBE_IMAGE_KIND_REFERENCE: "参考整套",
+    WARDROBE_IMAGE_KIND_NONE: "无法辨认",
+}
+
+WARDROBE_ASSET_ORIGIN_LABELS: dict[str, str] = {
+    ASSET_ORIGIN_LOCAL: "本地导入",
+    ASSET_ORIGIN_PANEL: "面板上传",
+    ASSET_ORIGIN_BLOGGER: "博主参考",
+    ASSET_ORIGIN_TAOBAO: "淘宝",
+    ASSET_ORIGIN_SHARE_TEXT: "分享文本",
+    ASSET_ORIGIN_SCREENSHOT: "截图",
+}
+
+# 缩略图只对位图有意义；视频帧与分享文本在队列里只显示一行字。
+_WARDROBE_DRAFT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 
 
 class WardrobeMixin:
@@ -969,6 +1011,192 @@ class WardrobeMixin:
             logger.debug("衣柜素材导入失败: %s", _single_line(exc, 160))
             return ""
         return str(record.get("id") or "")
+
+    # ------------------------------------------------------------------
+    # 草稿队列（素材 → 语义的人工确认环节）
+    #
+    # 批量导入只落草稿、不碰衣柜：识图会错，落库必须有人点头。这三个方法
+    # 与 scripts/wardrobe_review.py 共用同一套数据层（list_pending_drafts /
+    # apply_wardrobe_draft / mark_asset_status），所以面板与 CLI 不会分叉。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wardrobe_draft_row(row: Any) -> dict[str, Any]:
+        """把素材层的待办行整理成面板可以直接渲染的形状。"""
+
+        payload = row if isinstance(row, Mapping) else {}
+        kind = _single_line(payload.get("kind"), 32)
+        slot = _single_line(payload.get("slot"), 20)
+        origin = _single_line(payload.get("origin"), 32)
+        suffix = Path(str(payload.get("path") or "")).suffix.casefold()
+        tags: list[str] = []
+        for tag in payload.get("tags") or ():
+            text = _single_line(tag, WARDROBE_MAX_TAG)
+            if text and text not in tags:
+                tags.append(text)
+        try:
+            width = max(0, int(payload.get("width") or 0))
+            height = max(0, int(payload.get("height") or 0))
+        except (TypeError, ValueError):
+            width = height = 0
+        return {
+            "asset_id": _single_line(payload.get("asset_id"), 80),
+            "kind": kind,
+            # 还没识图的素材 kind 是空的，别显示成"未知类型"吓人。
+            "kind_label": WARDROBE_DRAFT_KIND_LABELS.get(kind, kind or "待识图"),
+            "name": _single_line(payload.get("name"), WARDROBE_MAX_NAME),
+            "description": _single_line(payload.get("description"), WARDROBE_MAX_DESCRIPTION),
+            "slot": slot,
+            "slot_label": WARDROBE_SLOT_LABELS.get(slot, "未分类"),
+            "tags": tags,
+            "origin": origin,
+            "origin_label": WARDROBE_ASSET_ORIGIN_LABELS.get(origin, origin or "未知来源"),
+            "has_draft": bool(payload.get("has_draft")),
+            "has_image": suffix in _WARDROBE_DRAFT_IMAGE_SUFFIXES,
+            "width": width,
+            "height": height,
+        }
+
+    def _wardrobe_pending_drafts(self) -> list[dict[str, Any]]:
+        """列出等待确认的草稿（素材状态仍是 imported）。
+
+        读不到数据目录或索引损坏时返回空列表：面板只该看到"队列是空的"，
+        而不是一条读不懂的报错。
+        """
+
+        data_dir = str(getattr(self, "data_dir", "") or "")
+        if not data_dir:
+            return []
+        try:
+            rows = list_pending_drafts(data_dir)
+        except Exception as exc:
+            logger.warning("读取衣柜草稿队列失败: %s", _single_line(exc, 160))
+            return []
+        return [self._wardrobe_draft_row(row) for row in rows or ()]
+
+    def _wardrobe_draft_overrides(self, overrides: Any) -> dict[str, Any]:
+        """只认面板能就地修改的字段；缺省或未提供的键一律不动。"""
+
+        payload = overrides if isinstance(overrides, Mapping) else {}
+        merged: dict[str, Any] = {}
+        for key, limit in (
+            ("name", WARDROBE_MAX_NAME),
+            ("description", WARDROBE_MAX_DESCRIPTION),
+            ("slot", WARDROBE_MAX_TAG),
+        ):
+            if key not in payload or payload.get(key) is None:
+                continue
+            merged[key] = _single_line(payload.get(key), limit)
+        return merged
+
+    async def _wardrobe_confirm_draft(
+        self, asset_id: Any, overrides: Any = None
+    ) -> dict[str, Any]:
+        """确认一条草稿；可带名称/描述/部位的覆盖。
+
+        顺序是「先落库、再推进素材状态」：保存失败时素材仍是 imported，
+        用户刷新队列还能重试，而不是得到一条既没入库又不能重试的孤儿。
+        """
+
+        clean_id = _single_line(asset_id, 80)
+        outcome: dict[str, Any] = {
+            "asset_id": clean_id,
+            "ok": False,
+            "kind": "",
+            "name": "",
+            "replaced": False,
+            "error": "",
+        }
+        if not clean_id:
+            outcome["error"] = "缺少素材编号。"
+            return outcome
+        data_dir = str(getattr(self, "data_dir", "") or "")
+        if not data_dir:
+            outcome["error"] = "插件没有数据目录，草稿队列不可用。"
+            return outcome
+        try:
+            record = load_asset_index(data_dir).get(clean_id)
+        except Exception as exc:
+            logger.warning("读取衣柜素材索引失败: %s", _single_line(exc, 160))
+            record = None
+        if record is None:
+            outcome["error"] = "素材不在索引里，刷新队列看看。"
+            return outcome
+        if str(record.get("status") or ASSET_STATUS_IMPORTED) != ASSET_STATUS_IMPORTED:
+            outcome["error"] = "这条素材已经处理过了，刷新队列看看。"
+            return outcome
+        try:
+            draft = load_asset_draft(data_dir, clean_id)
+        except Exception as exc:
+            logger.warning("读取衣柜草稿失败: %s", _single_line(exc, 160))
+            draft = None
+        if not draft:
+            outcome["error"] = "这条素材还没有草稿（先跑识图）。"
+            return outcome
+        merged = dict(draft)
+        merged.update(self._wardrobe_draft_overrides(overrides))
+        source = ""
+        try:
+            source = str(asset_abs_path(data_dir, record))
+        except Exception:
+            source = ""
+        # 分流只有一处实现（数据层 apply_wardrobe_draft）：命令路径、CLI 与
+        # 面板队列必须落在同一个库里，否则"整套"会时不时钻进散件列表。
+        items, outfits, applied = apply_wardrobe_draft(
+            self._wardrobe_items(), self._wardrobe_outfits(), merged, asset_id=clean_id, source=source
+        )
+        outcome["kind"] = str(applied.get("kind") or "")
+        outcome["name"] = str(applied.get("name") or "")
+        outcome["replaced"] = bool(applied.get("replaced"))
+        if not applied.get("ok"):
+            outcome["error"] = str(applied.get("error") or "没有识别出可用的衣物。")
+            return outcome
+        if not await self._save_wardrobe_state(items=items, outfits=outfits):
+            outcome["error"] = "草稿已应用，但保存失败，请到面板确认配置是否可写。"
+            return outcome
+        try:
+            mark_asset_status(data_dir, clean_id, ASSET_STATUS_UNDERSTOOD)
+        except Exception as exc:
+            # 衣柜已经落库了，这一步失败只影响队列显示（会继续显示待确认），
+            # 不该让用户重做一遍，所以只记日志。
+            logger.warning("推进衣柜素材状态失败: %s", _single_line(exc, 160))
+        # 把落库后的那一行也带回去：面板要并进本地列表，否则"刚确认完再点保存"
+        # 会拿确认前的隐藏字段把它覆盖掉。
+        stored = (
+            find_wardrobe_outfit(outfits, outcome["name"])
+            if outcome["kind"] in (WARDROBE_IMAGE_KIND_OUTFIT, WARDROBE_IMAGE_KIND_REFERENCE)
+            else find_wardrobe_item(items, outcome["name"])
+        )
+        if stored:
+            outcome["row"] = dict(stored)
+        outcome["ok"] = True
+        outcome["items_total"] = len(items)
+        outcome["outfits_total"] = len(outfits)
+        return outcome
+
+    async def _wardrobe_reject_draft(self, asset_id: Any) -> dict[str, Any]:
+        """丢弃一条草稿：只把素材推进到 rejected，衣柜一个字节都不动。"""
+
+        clean_id = _single_line(asset_id, 80)
+        outcome: dict[str, Any] = {"asset_id": clean_id, "ok": False, "error": ""}
+        if not clean_id:
+            outcome["error"] = "缺少素材编号。"
+            return outcome
+        data_dir = str(getattr(self, "data_dir", "") or "")
+        if not data_dir:
+            outcome["error"] = "插件没有数据目录，草稿队列不可用。"
+            return outcome
+        try:
+            record = mark_asset_status(data_dir, clean_id, ASSET_STATUS_REJECTED)
+        except Exception as exc:
+            logger.warning("丢弃衣柜草稿失败: %s", _single_line(exc, 160))
+            record = None
+        if record is None:
+            outcome["error"] = "素材不在索引里，刷新队列看看。"
+            return outcome
+        outcome["ok"] = True
+        return outcome
+
 
     def _wardrobe_overview_text(self) -> str:
         tendency = self._wardrobe_tendency()
