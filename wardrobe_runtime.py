@@ -56,7 +56,9 @@ from .wardrobe import (
     delete_wardrobe_item,
     delete_wardrobe_outfit,
     find_wardrobe_item,
+    find_wardrobe_item_by_exact_name,
     find_wardrobe_outfit,
+    find_wardrobe_outfit_by_exact_name,
     infer_wardrobe_slot,
     normalize_wardrobe_image_prompt,
     normalize_wardrobe_items,
@@ -1814,10 +1816,12 @@ class WardrobeMixin:
             logger.warning("推进衣柜素材状态失败: %s", _single_line(exc, 160))
         # 把落库后的那一行也带回去：面板要并进本地列表，否则"刚确认完再点保存"
         # 会拿确认前的隐藏字段把它覆盖掉。
+        # 用**精确同名**取回落库那一行：宽松查找（id/序号/子串）会取回别人那一行，
+        # 面板把它并进本地列表后就串行了。
         stored = (
-            find_wardrobe_outfit(outfits, outcome["name"])
+            find_wardrobe_outfit_by_exact_name(outfits, outcome["name"])
             if outcome["kind"] in (WARDROBE_IMAGE_KIND_OUTFIT, WARDROBE_IMAGE_KIND_REFERENCE)
-            else find_wardrobe_item(items, outcome["name"])
+            else find_wardrobe_item_by_exact_name(items, outcome["name"])
         )
         if stored:
             outcome["row"] = dict(stored)

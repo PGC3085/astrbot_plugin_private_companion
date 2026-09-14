@@ -178,7 +178,7 @@ WARDROBE_PRECISIONS = (PRECISION_EXACT, PRECISION_LOOSE)
 #   3. 该由谁来配、配得合不合适，交给生成器结合场景描述判断更合适。
 # 场景仍然作为**上下文**传给生成器，并参与选取种子，只是不再过滤候选。
 
-_TAG_SPLIT_PATTERN = re.compile(r"[,，、/|;；\s]+")
+_TAG_SPLIT_PATTERN = re.compile(r"[,，、/|;；｜\s]+")  # 含全角竖线 U+FF5C：默认提示词让模型用竖线分隔
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
 __all__ = [
@@ -236,6 +236,8 @@ __all__ = [
     "new_wardrobe_item",
     "add_wardrobe_item",
     "find_wardrobe_item",
+    "find_wardrobe_item_by_exact_name",
+    "find_wardrobe_outfit_by_exact_name",
     "resolve_wardrobe_reference",
     "delete_wardrobe_item",
     "update_wardrobe_item",
@@ -508,6 +510,40 @@ def wardrobe_item_name_key(value: Any) -> str:
     """Return the case/space-insensitive identity key for an item name."""
 
     return clean_wardrobe_text(value, WARDROBE_MAX_NAME).casefold().replace(" ", "")
+
+
+def find_wardrobe_item_by_exact_name(
+    items: Sequence[Mapping[str, Any]] | None, name: Any
+) -> dict[str, Any] | None:
+    """按**精确同名**查找散件。
+
+    与 :func:`find_wardrobe_item` 的区别：那条是给「用户点名」用的宽松规则
+    （id → 1-based 序号 → 名字 → 子串）。草稿落库判断「是不是同一件」必须用精确同名，
+    否则一件叫「3」或「开衫」的新衣物会被误判成已存在：replaced 报 true、面板取回
+    别人那一行，而列表里其实新建了一条。
+    """
+
+    key = wardrobe_item_name_key(name)
+    if not key:
+        return None
+    for row in normalize_wardrobe_items(list(items or ())):
+        if wardrobe_item_name_key(row.get("name")) == key:
+            return row
+    return None
+
+
+def find_wardrobe_outfit_by_exact_name(
+    outfits: Sequence[Mapping[str, Any]] | None, name: Any
+) -> dict[str, Any] | None:
+    """按精确同名查找整套（理由同 :func:`find_wardrobe_item_by_exact_name`）。"""
+
+    key = wardrobe_item_name_key(name)
+    if not key:
+        return None
+    for row in normalize_wardrobe_outfits(list(outfits or ())):
+        if wardrobe_item_name_key(row.get("name")) == key:
+            return row
+    return None
 
 
 def _normalize_source_kind(value: Any, *, source: str) -> str:
@@ -1331,11 +1367,15 @@ def _split_labelled_lines(raw: str) -> tuple[dict[str, str], list[str]]:
         stripped = line.strip()
         if not stripped:
             continue
+        # 模型常把字段写成项目符号（"- 类型：无关"）。先剥掉行首符号再匹配标签，
+        # 否则整段落到「未标注文本」、类型判定失效 —— 实测一张「无关」的图会被落库成
+        # 一件叫「- 类型：无关 - 名称」的衣服，与「类型写了但认不出就别猜」的声明矛盾。
+        candidate = re.sub(r"^[-*•·]+\s*", "", stripped) or stripped
         matched = False
         for key, pattern in _FIELD_PATTERNS.items():
             if key in fields:
                 continue
-            match = pattern.match(stripped)
+            match = pattern.match(candidate)
             if match:
                 fields[key] = match.group("value").strip()
                 matched = True
@@ -1613,6 +1653,13 @@ def add_wardrobe_outfit(
         if not replace_existing:
             raise WardrobeError(f"衣柜里已经有「{outfit['name']}」这套了")
         merged = dict(outfit)
+        # 素材引用取并集、归属取新值 —— 与 add_wardrobe_item 的同名分支保持一致。
+        # 少了这两行会出现：第二张图的 asset_id 静默丢失；把「参考整套」重新识图成自有
+        # （或反过来）时归属永不更新，于是别人的整套会被当成自有参与每日轮换。
+        merged_assets = list(outfit.get("asset_ids") or ())
+        for asset_id in incoming.get("asset_ids") or ():
+            if asset_id not in merged_assets:
+                merged_assets.append(asset_id)
         merged.update(
             {
                 "name": incoming["name"],
@@ -1620,6 +1667,12 @@ def add_wardrobe_outfit(
                 "style": incoming["style"] or outfit.get("style", ""),
                 "items": incoming["items"] or list(outfit.get("items") or ()),
                 "precision": incoming["precision"],
+                "asset_ids": normalize_asset_ids(merged_assets),
+                "ownership": (
+                    incoming.get("ownership")
+                    or outfit.get("ownership")
+                    or OWNERSHIP_OWNED
+                ),
                 "created_at": outfit.get("created_at") or incoming["created_at"],
                 "updated_at": incoming["updated_at"],
             }
@@ -1880,7 +1933,8 @@ def apply_wardrobe_draft(
         outcome["kind"] = kind
 
     if kind in (WARDROBE_IMAGE_KIND_OUTFIT, WARDROBE_IMAGE_KIND_REFERENCE):
-        existing = find_wardrobe_outfit(current_outfits, name)
+        # 精确同名：草稿带的是「名字」，不是用户点名引用（见 find_*_by_exact_name）
+        existing = find_wardrobe_outfit_by_exact_name(current_outfits, name)
         try:
             current_outfits, stored = add_wardrobe_outfit(
                 current_outfits,
@@ -1908,7 +1962,7 @@ def apply_wardrobe_draft(
         return current_items, current_outfits, outcome
 
     description = clean_wardrobe_text(payload.get("description"), WARDROBE_MAX_DESCRIPTION)
-    existing_item = find_wardrobe_item(current_items, name)
+    existing_item = find_wardrobe_item_by_exact_name(current_items, name)
     slot = normalize_wardrobe_slot(payload.get("slot")) or infer_wardrobe_slot(name, description)
     try:
         current_items, stored_item = add_wardrobe_item(

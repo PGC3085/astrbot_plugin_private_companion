@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -193,6 +194,18 @@ def asset_drafts_dir(data_dir: str | os.PathLike[str]) -> Path:
     return asset_root(data_dir) / ASSET_DRAFTS_DIR_NAME
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """把任意值折成非负整数；非法 / NaN / Inf 一律回落到 default。"""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return max(0, int(number))
+
+
 def normalize_asset(raw: Any) -> dict[str, Any] | None:
     """Normalize one stored asset row; unusable rows return None."""
 
@@ -217,9 +230,11 @@ def normalize_asset(raw: Any) -> dict[str, Any] | None:
         "source_path": _clean_text(raw.get("source_path"), ASSET_MAX_SOURCE_PATH),
         "origin_note": _clean_text(raw.get("origin_note"), ASSET_MAX_ORIGIN_NOTE),
         "status": normalize_asset_status(raw.get("status")),
-        "bytes": max(0, int(raw.get("bytes") or 0)),
-        "width": max(0, int(raw.get("width") or 0)),
-        "height": max(0, int(raw.get("height") or 0)),
+        # 与上面的 created_at 同规格：一行坏数据（例如手改出来的 "1.2MB"）
+        # 不该让整份索引读不出来。
+        "bytes": _safe_int(raw.get("bytes")),
+        "width": _safe_int(raw.get("width")),
+        "height": _safe_int(raw.get("height")),
         "created_at": created_at,
     }
     draft = raw.get("draft")
@@ -261,13 +276,27 @@ def normalize_asset_index(value: Any) -> dict[str, dict[str, Any]]:
     return index
 
 
+def _quarantine_asset_index(path: Path) -> Path | None:
+    """把读不出来的索引改名留档，避免下一次 save 把原始数据直接覆盖掉。"""
+
+    try:
+        backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        path.replace(backup)
+        return backup
+    except Exception:
+        return None
+
+
 def load_asset_index(data_dir: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
     path = asset_index_path(data_dir)
     if not path.is_file():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+        # utf-8-sig：编辑器另存为「UTF-8 带 BOM」是很常见的一步，用 utf-8 读会直接
+        # JSONDecodeError，整份索引被当成空 —— 下一次 save 就把它抹掉了。
+        payload = json.loads(path.read_bytes().decode("utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        _quarantine_asset_index(path)
         return {}
     if isinstance(payload, Mapping) and "assets" in payload:
         payload = payload.get("assets")
@@ -282,7 +311,11 @@ def save_asset_index(data_dir: str | os.PathLike[str], index: Mapping[str, Any])
         "updated_at": time.time(),
         "assets": list(normalize_asset_index(index).values()),
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 原子替换：写一半被打断（进程被杀、磁盘满）不该留下半份索引 —— 半份索引在下次
+    # load 时会被当成空，再 save 一次就把全部素材记录抹掉。
+    temp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, path)
     return path
 
 
