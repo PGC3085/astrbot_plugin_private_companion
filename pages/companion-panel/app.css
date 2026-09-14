@@ -35726,3 +35726,62 @@ input:checked + .rt2-switch-track.lg::after,
 .wardrobe-draft-fields input[type="text"], .wardrobe-draft-fields textarea, .wardrobe-draft-fields select { width: 100%; }
 .wardrobe-draft-hint { color: var(--text-muted, #6b7280); font-size: 11px; }
 .wardrobe-draft-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+/* ---------- 今天的穿衣意图（追加） ---------- */
+.wardrobe-intent {
+  margin: 12px 0 16px;
+  border: 1px solid var(--border-soft, rgba(148, 163, 184, 0.3));
+  border-radius: 12px;
+  background: var(--surface, rgba(255, 255, 255, 0.6));
+}
+.wardrobe-intent > summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  padding: 10px 14px;
+  list-style: none;
+}
+.wardrobe-intent > summary::-webkit-details-marker { display: none; }
+.wardrobe-intent > summary span { display: grid; gap: 2px; }
+.wardrobe-intent > summary b { font-size: 13px; }
+.wardrobe-intent > summary small { color: var(--text-muted, #6b7280); font-size: 12px; }
+.wardrobe-intent-count {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--surface-soft, rgba(148, 163, 184, 0.16));
+  color: var(--text-muted, #6b7280);
+  font-size: 12px;
+}
+.wardrobe-intent-body {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--border-soft, rgba(148, 163, 184, 0.2));
+}
+.wardrobe-intent-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.wardrobe-intent-action { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wardrobe-intent-detail { display: grid; gap: 10px; }
+.wardrobe-intent-note {
+  margin: 0;
+  color: var(--text-muted, #6b7280);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.wardrobe-intent-meta {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+}
+.wardrobe-intent-meta > div { display: flex; justify-content: space-between; gap: 12px; }
+.wardrobe-intent-meta dt { color: var(--text-muted, #6b7280); }
+.wardrobe-intent-meta dd { margin: 0; word-break: break-word; }
+.wardrobe-intent-items { display: grid; gap: 4px; font-size: 12px; }
+.wardrobe-intent-item {
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface-soft, rgba(148, 163, 184, 0.12));
+}

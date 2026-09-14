@@ -710,10 +710,15 @@ window.PrivateCompanionWardrobe = (() => {
     bindOutfitPreview(context);
     bindOutfitActions(context);
     bindDraftActions(context);
+    bindIntentActions(context);
     commit(context);
     bindActions(context);
-    // 草稿队列是异步的：读不到只影响这一块，不该挡住衣柜本身。
+    // 草稿队列与穿衣意图都是异步的：读不到只影响各自那一块，不该挡住衣柜本身。
     void refreshDrafts(context, { silent: true });
+    // 穿衣意图只在展开时拉取；上次打开过（浏览器记住了状态）就顺手补一次。
+    if (contextDocument(context)?.querySelector("[data-wardrobe-intent]")?.open === true) {
+      void refreshIntent(context, { silent: true });
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1136,6 +1141,198 @@ window.PrivateCompanionWardrobe = (() => {
   }
 
   // ------------------------------------------------------------------
+  // 今天的穿衣意图：只读 + 清除
+  //
+  // 意图就是作者那套 dialogue_outfit_override（模型工具或用户对话写的），
+  // 它优先于当天轮换；面板只看和清，写入归模型工具，所以这里没有保存按钮。
+  // ------------------------------------------------------------------
+
+  // 两个按钮各有一个 aria-live 状态区：读取与清除的消息互不覆盖。
+  const INTENT_STATUS = "[data-wardrobe-intent-status]";
+  const INTENT_CLEAR_STATUS = "[data-wardrobe-intent-clear-status]";
+  const INTENT_SOURCE_LABELS = { model_tool: "模型记录", user_dialogue: "用户对话" };
+
+  // undefined 表示还没读过：badge 显示「未读取」，而不是谎报「无」；null 专指确实没有。
+  let intent;
+  let intentBound = false;
+
+  function intentSourceLabel(source) {
+    const key = cleanText(source, 40);
+    return INTENT_SOURCE_LABELS[key] || key || "未知来源";
+  }
+
+  function intentSlotLabel(slot) {
+    const key = cleanText(slot, 20);
+    const entry = SLOT_OPTIONS.find(([value]) => value === key);
+    return entry ? entry[1] : key || "未分类";
+  }
+
+  // 后端给的是秒级时间戳；面板只显示本地时间的时分，够用来判断还剩多久。
+  function intentClock(value) {
+    const stamp = Number(value);
+    if (!Number.isFinite(stamp) || stamp <= 0) return "—";
+    const date = new Date(stamp * 1000);
+    if (Number.isNaN(date.getTime())) return "—";
+    const pad = (part) => String(part).padStart(2, "0");
+    return pad(date.getHours()) + ":" + pad(date.getMinutes());
+  }
+
+  function normalizeIntent(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const items = (Array.isArray(raw.items) ? raw.items : [])
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return null;
+        const id = cleanText(entry.id, 80);
+        const name = cleanText(entry.name, MAX_NAME);
+        if (!id && !name) return null;
+        return { id, name: name || id, slot: cleanText(entry.slot, 20) };
+      })
+      .filter(Boolean);
+    const row = {
+      instruction: cleanText(raw.instruction, 180),
+      source: cleanText(raw.source, 40),
+      date: cleanText(raw.date, 16),
+      expires_at: Number(raw.expires_at) || 0,
+      outfit_name: cleanText(raw.outfit_name, MAX_OUTFIT_NAME),
+      items,
+    };
+    // 没有意图时后端回 {}：一个字段都没读到就当没有，别显示一个空壳。
+    if (!row.instruction && !row.outfit_name && !row.items.length) return null;
+    return row;
+  }
+
+  function intentBadgeText() {
+    if (intent === undefined) return "未读取";
+    if (!intent) return "无";
+    return "有 · " + intentSourceLabel(intent.source);
+  }
+
+  function renderIntent(context) {
+    const document = contextDocument(context);
+    const counter = document?.querySelector("[data-wardrobe-intent-count]");
+    if (counter) counter.textContent = intentBadgeText();
+    const clear = document?.querySelector("[data-wardrobe-intent-clear]");
+    if (clear) clear.disabled = !intent;
+    const host = document?.querySelector("[data-wardrobe-intent-detail]");
+    if (!host) return;
+    host.textContent = "";
+    if (!intent) {
+      const empty = document.createElement("p");
+      empty.className = "wardrobe-empty";
+      empty.textContent = "当前没有额外指定，按当天轮换着装。";
+      host.appendChild(empty);
+      return;
+    }
+
+    const note = document.createElement("p");
+    note.className = "wardrobe-intent-note";
+    note.textContent = "本会话指定的着装优先于当天轮换：下一次注入按它来，不再用当天裁决出的那一套。";
+    host.appendChild(note);
+
+    const meta = document.createElement("dl");
+    meta.className = "wardrobe-intent-meta";
+    const rows = [
+      ["指令原文", intent.instruction || "（没有留下原文）"],
+      ["来源", intentSourceLabel(intent.source)],
+      ["到期", intentClock(intent.expires_at) + (intent.date ? " · " + intent.date : "")],
+    ];
+    if (intent.outfit_name) rows.push(["整套", intent.outfit_name]);
+    rows.forEach(([label, value]) => {
+      const cell = document.createElement("div");
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const detail = document.createElement("dd");
+      detail.textContent = value;
+      cell.append(term, detail);
+      meta.appendChild(cell);
+    });
+    host.appendChild(meta);
+
+    const picked = document.createElement("div");
+    picked.className = "wardrobe-intent-items";
+    if (!intent.items.length) {
+      const none = document.createElement("p");
+      none.className = "wardrobe-empty";
+      none.textContent = "这条意图没有点名具体衣物，模型会照这句话自己挑。";
+      picked.appendChild(none);
+    } else {
+      intent.items.forEach((item) => {
+        const line = document.createElement("span");
+        line.className = "wardrobe-intent-item";
+        line.textContent = item.name + " · " + intentSlotLabel(item.slot);
+        picked.appendChild(line);
+      });
+    }
+    host.appendChild(picked);
+  }
+
+  async function refreshIntent(context, options = {}) {
+    const document = contextDocument(context);
+    const postJson = context?.postJson;
+    if (!document || !postJson) return;
+    const silent = options.silent === true;
+    if (!silent) setBlockStatus(context, INTENT_STATUS, "正在读取穿衣意图…");
+    try {
+      const payload = apiPayload(await postJson("/wardrobe/intent", {})) || {};
+      intent = normalizeIntent(payload.intent);
+      renderIntent(context);
+      if (!silent) {
+        setBlockStatus(
+          context,
+          INTENT_STATUS,
+          intent ? "已读取本会话的穿衣意图。" : "当前没有额外指定，按当天轮换着装。",
+          "ok",
+        );
+      }
+    } catch (error) {
+      if (!silent) setBlockStatus(context, INTENT_STATUS, error?.message || "读取穿衣意图失败，请稍后再试。", "error");
+    }
+  }
+
+  async function clearIntent(context) {
+    const postJson = context?.postJson;
+    if (!postJson) return;
+    setBlockStatus(context, INTENT_CLEAR_STATUS, "正在清除穿衣意图…");
+    try {
+      const payload = apiPayload(await postJson("/wardrobe/intent-clear", {})) || {};
+      // 清完必须重读一次：badge、衣物列表和清除按钮的可用状态都跟着快照走。
+      await refreshIntent(context, { silent: true });
+      // 快照已经变了，读取区的旧文案会跟 badge 打架，先清掉。
+      setBlockStatus(context, INTENT_STATUS, "");
+      setBlockStatus(
+        context,
+        INTENT_CLEAR_STATUS,
+        payload.cleared === true ? "已清除，之后按当天轮换着装。" : "本来就没有穿衣意图。",
+        "ok",
+      );
+    } catch (error) {
+      setBlockStatus(context, INTENT_CLEAR_STATUS, error?.message || "清除失败，请稍后再试。", "error");
+    }
+  }
+
+  function bindIntentActions(context) {
+    const document = contextDocument(context);
+    const root = document?.querySelector("[data-wardrobe-intent]");
+    if (!root || intentBound) return;
+    intentBound = true;
+    root.addEventListener("toggle", () => {
+      // 与草稿队列同一思路：没展开这一块的人不必为此付一次请求。
+      if (root.open) void refreshIntent(context);
+    });
+    root.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.hasAttribute("data-wardrobe-intent-refresh")) {
+        void refreshIntent(context);
+        return;
+      }
+      if (target.hasAttribute("data-wardrobe-intent-clear")) {
+        void clearIntent(context);
+      }
+    });
+  }
+
+  // ------------------------------------------------------------------
   // 搭配测试：只读预览
   //
   // 直接问后端"这一刻会注入什么"，不写配置、不调模型，所以可以随便点。
@@ -1314,5 +1511,8 @@ window.PrivateCompanionWardrobe = (() => {
     confirmWardrobeDraft: (context, assetId) => confirmDraft(context, assetId),
     rejectWardrobeDraft: (context, assetId) => rejectDraft(context, assetId),
     applyAllWardrobeDrafts: (context) => applyAllDrafts(context),
+    wardrobeIntentForTest: () => (intent ? { ...intent, items: intent.items.map((row) => ({ ...row })) } : intent),
+    refreshWardrobeIntent: (context) => refreshIntent(context),
+    clearWardrobeIntent: (context) => clearIntent(context),
   };
 })();

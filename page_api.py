@@ -1328,6 +1328,8 @@ class PrivateCompanionPageApi(
             ("/wardrobe/draft-apply", self.confirm_wardrobe_draft, ["POST"], "Private Companion Page apply wardrobe draft"),
             ("/wardrobe/draft-reject", self.reject_wardrobe_draft, ["POST"], "Private Companion Page reject wardrobe draft"),
             ("/wardrobe/asset-image", self.get_wardrobe_asset_image, ["POST"], "Private Companion Page wardrobe asset image data"),
+            ("/wardrobe/intent", self.get_wardrobe_intent, ["POST"], "Private Companion Page wardrobe session intent"),
+            ("/wardrobe/intent-clear", self.clear_wardrobe_intent, ["POST"], "Private Companion Page clear wardrobe session intent"),
             ("/photo_reference/metadata/compile", self.compile_photo_reference_metadata, ["POST"], "Compile guided photo reference metadata"),
             ("/photo_reference/metadata/review", self.review_photo_reference_metadata, ["POST"], "Review and merge guided photo reference answers"),
             ("/photo_reference/selection_trial", self.run_photo_reference_selection_trial, ["POST"], "Run side-effect-free photo reference selection trial"),
@@ -4123,6 +4125,36 @@ class PrivateCompanionPageApi(
         except Exception as exc:
             logger.warning("读取衣柜素材图片失败: %s", self._single_line(exc, 160))
             return self._exception_error("读取衣柜素材图片失败")
+
+    async def get_wardrobe_intent(self) -> dict[str, Any]:
+        """Read the session outfit intent for the wardrobe panel.
+
+        Read-only: it only asks the plugin for the author's dialogue_outfit_override
+        snapshot, so the panel can show what this session asked the character to wear.
+        """
+
+        reader = getattr(self.plugin, "_wardrobe_intent_snapshot", None)
+        if not callable(reader):
+            return self._error("当前插件实例不支持穿衣意图")
+        try:
+            snapshot = reader()
+        except Exception as exc:
+            logger.warning("穿衣意图读取失败: %s", self._single_line(exc, 160), exc_info=True)
+            return self._error("读取穿衣意图失败，请稍后再试")
+        return self._ok({"intent": snapshot if isinstance(snapshot, dict) else {}})
+
+    async def clear_wardrobe_intent(self) -> dict[str, Any]:
+        """Clear the session outfit intent so the daily rotation takes over again."""
+
+        clearer = getattr(self.plugin, "_wardrobe_clear_intent", None)
+        if not callable(clearer):
+            return self._error("当前插件实例不支持穿衣意图")
+        try:
+            cleared = bool(clearer())
+        except Exception as exc:
+            logger.warning("穿衣意图清除失败: %s", self._single_line(exc, 160), exc_info=True)
+            return self._error("清除穿衣意图失败，请稍后再试")
+        return self._ok({"cleared": cleared})
 
     async def upload_photo_reference(self) -> dict[str, Any]:
         content_length = request.content_length
