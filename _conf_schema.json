@@ -14450,6 +14450,17 @@
           "enable_wardrobe_prompt": true
         }
       },
+      "wardrobe_photo_source": {
+        "description": "每日穿搭照片的衣着来源",
+        "type": "string",
+        "options": ["wardrobe", "builtin"],
+        "labels": ["用衣柜裁决的那一套", "沿用插件自带候选表"],
+        "hint": "wardrobe：每日穿搭照片改穿衣柜里裁决出的那一套（含 footwear 等字段）；builtin：沿用插件原有的场景候选表。衣柜为空时自动回落。",
+        "default": "wardrobe",
+        "condition": {
+          "enable_wardrobe": true
+        }
+      },
       "wardrobe_outfit_rotation_days": {
         "description": "着装轮换冷却天数",
         "type": "int",

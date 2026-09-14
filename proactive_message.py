@@ -261,6 +261,7 @@ from .reference_assets import (
     normalize_reference_owner_id,
     reference_asset_tokens,
 )
+from .wardrobe_photo import resolve_daily_outfit_profile as resolve_wardrobe_daily_outfit_profile
 from .photo_wardrobe_decision import (
     PhotoWardrobeDecision,
     PhotoWardrobeIntent,
@@ -11239,6 +11240,8 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             "top": 160,
             "outer": 160,
             "bottom": 140,
+            # 衣柜生图投影里有 footwear：不加进来会被静默丢弃
+            "footwear": 140,
             "accessory": 140,
         }
         return {
@@ -11483,19 +11486,24 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         weather: str,
         date_key: str = "",
     ) -> dict[str, str]:
+        # 衣柜接管：有可用裁决时优先用它（取不到就落回作者的候选表）
+        wardrobe_profile = resolve_wardrobe_daily_outfit_profile(self, date_key=date_key)
+        if wardrobe_profile:
+            return wardrobe_profile
         scene = self._daily_outfit_scene_kind(schedule_hint, weather)
         weather_kind = self._daily_outfit_weather_kind(weather)
         candidates = self._daily_outfit_candidate_profiles(scene, weather_kind)
         if not candidates:
             return {}
         history = self._daily_outfit_rotation_history()
-        fields = ("palette", "silhouette", "top", "outer", "bottom", "accessory")
+        fields = ("palette", "silhouette", "top", "outer", "bottom", "footwear", "accessory")
         weights = {
             "palette": 16,
             "silhouette": 12,
             "top": 20,
             "outer": 18,
             "bottom": 10,
+            "footwear": 9,
             "accessory": 8,
         }
 
@@ -11937,6 +11945,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 ("top", "top"),
                 ("outer", "outer layer"),
                 ("bottom", "bottoms"),
+                ("footwear", "footwear"),
                 ("accessory", "accessories"),
             )
             hints = ["intentionally distinct coordinated daily outfit"]
