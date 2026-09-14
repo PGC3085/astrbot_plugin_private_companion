@@ -33,6 +33,15 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date
 from typing import Any
 
+try:  # 包内导入：插件运行时与 pytest 都按包加载本模块
+    from .wardrobe_decision import pack_entries, score_priority, weight_for_rank
+except ImportError:  # scripts/ 下的离线工具把本模块当顶层模块加载（插件根直插 sys.path）
+    from wardrobe_decision import (  # type: ignore[no-redef]
+        pack_entries,
+        score_priority,
+        weight_for_rank,
+    )
+
 WARDROBE_VERSION = 1
 
 WARDROBE_MAX_ITEMS = 40
@@ -902,6 +911,60 @@ def _truncate_block(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+# 决策层（wardrobe_decision）在渲染路径上的两维打分。这里只把「衣物事实」
+# 翻译成数字，装箱算法本身不认识部位、贴身这些概念。
+#
+# weight —— 渲染时谁更靠下（数值越大越靠后）：整身 → 上装 → 下装 → 鞋袜 →
+# 配件 → 未分类。架构提案把它写作「整身 > 上装 > 外套 > 下装 > 鞋袜 > 配件」，
+# 其中「外套」是**层次**概念：本模块的部位模型把外套归入上装（见 _SLOT_ALIASES
+# 与 _SLOT_SUBSTRING_HINTS），所以这里没有单独一档。将来真引入 layer 维度时，
+# 在 _RENDER_SLOT_ORDER 里插一档即可，装箱逻辑一行都不用改。
+_RENDER_SLOT_ORDER = (SLOT_WHOLE, SLOT_UPPER, SLOT_LOWER, SLOT_FEET, SLOT_EXTRA, "")
+_RENDER_SLOT_RANKS = {slot: index for index, slot in enumerate(_RENDER_SLOT_ORDER)}
+
+
+def _slot_header(slot: str) -> str:
+    # 刻意不用全角方括号做标题：仓库的 CI（scripts/ci_static_checks.py 的
+    # raw_legacy_heading 规则）把提示词里的字面量方括号标题视为待淘汰的旧写法
+    # 语法，只允许 canonical renderer 使用。这里用分隔线代替。
+    return f"── {WARDROBE_SLOT_LABELS.get(slot, '未分类')} ──"
+
+
+def _wardrobe_notice(count: int) -> str:
+    """截断提示。丢弃件数不管是条数上限还是字符预算造成的，都算在这里。"""
+
+    return f"（另有 {count} 件未列出）"
+
+
+def _render_candidate(item: Mapping[str, Any]) -> dict[str, Any]:
+    """把一个衣物条目打成装箱候选：渲染行 + priority + weight。
+
+    行文本与长度必须同源：`line` 就是最终写进提示词的那一行，装箱按
+    `len(line) + 1`（含换行）计价，所以"预算内"与"实际渲染"不会是两套算法。
+    """
+
+    slot = str(item.get("slot") or "")
+    detail = clean_wardrobe_text(item.get("description"), 120)
+    tags = list(item.get("tags") or [])
+    if item.get("intimate"):
+        # 贴身件仍然进对话注入，但打上标记，方便模型区分层次。
+        tags = ["贴身", *tags]
+    suffix = f"（{'/'.join(tags)}）" if tags else ""
+    line = f"- {item['name']}{suffix}：{detail}" if detail else f"- {item['name']}{suffix}"
+    return {
+        "slot": slot,
+        "line": line,
+        # priority：预算不足时先丢谁 —— 已分类 > 未分类，有描述 > 无描述。
+        "priority": score_priority(
+            classified=bool(slot),
+            described=bool(detail),
+            intimate=bool(item.get("intimate")),
+        ),
+        # weight：最终文本里谁更靠下（数值大者在后）。
+        "weight": weight_for_rank(_RENDER_SLOT_RANKS.get(slot, len(_RENDER_SLOT_ORDER))),
+    }
+
+
 def render_wardrobe_block(
     tendency: Any,
     items: Sequence[Mapping[str, Any]] | None,
@@ -914,6 +977,12 @@ def render_wardrobe_block(
     Items are grouped by slot so the model can tell an upper garment from a
     lower one without guessing from the name.  No occasion filtering happens
     here: see the module header for why scene is context, not a hard filter.
+
+    分组里的条目走决策层的三趟式装箱（见 :mod:`wardrobe_decision`）：预算不足时
+    先丢未分类的、再丢没描述的；留下的按 weight（部位顺序）重排，所以"丢谁"与
+    "排哪儿"是两个独立维度。丢掉多少件就在末尾标注"（另有 N 件未列出）"。
+    装箱用的长度就是这里真实的渲染行长度，因此 `max_chars` 是硬保证，
+    最后的 :func:`_truncate_block` 只是兜底（例如连倾向那一行都放不下时）。
     """
 
     clean_tendency = normalize_wardrobe_tendency(tendency)
@@ -923,41 +992,38 @@ def render_wardrobe_block(
     lines: list[str] = []
     if clean_tendency:
         lines.append(f"整体服饰倾向：{clean_tendency}")
-    if normalized:
-        lines.append("衣柜里的具体衣物：")
-        grouped: dict[str, list[Mapping[str, Any]]] = {}
-        for item in normalized:
-            grouped.setdefault(str(item.get("slot") or ""), []).append(item)
-        emitted = 0
-        truncated = False
-        # 已分类的按部位固定顺序输出；「未分类」排在最后，顺序保持稳定。
-        for slot in (*WARDROBE_SLOTS, ""):
-            bucket = grouped.get(slot) or []
-            if not bucket:
-                continue
-            if max_items and emitted >= max_items:
-                truncated = True
-                break
-            # 刻意不用全角方括号做标题：仓库的 CI（scripts/ci_static_checks.py 的
-            # raw_legacy_heading 规则）把提示词里的字面量方括号标题视为待淘汰的旧写法
-            # 语法，只允许 canonical renderer 使用。这里用分隔线代替。
-            lines.append(f"── {WARDROBE_SLOT_LABELS.get(slot, '未分类')} ──")
-            for item in bucket:
-                if max_items and emitted >= max_items:
-                    truncated = True
-                    break
-                emitted += 1
-                detail = clean_wardrobe_text(item.get("description"), 120)
-                tags = list(item.get("tags") or [])
-                if item.get("intimate"):
-                    # 贴身件仍然进对话注入，但打上标记，方便模型区分层次。
-                    tags = ["贴身", *tags]
-                suffix = f"（{'/'.join(tags)}）" if tags else ""
-                lines.append(f"- {item['name']}{suffix}：{detail}" if detail else f"- {item['name']}{suffix}")
-            if truncated:
-                break
-        if truncated:
-            lines.append(f"（另有 {len(normalized) - emitted} 件未列出）")
+    if not normalized:
+        return _truncate_block("\n".join(lines), max_chars)
+    lines.append("衣柜里的具体衣物：")
+    candidates = [_render_candidate(item) for item in normalized]
+    # 每条候选按「正文 + 换行」计价，而最后一行没有换行，所以可用额度比 max_chars 多 1。
+    available = max_chars + 1 - sum(len(line) + 1 for line in lines)
+    group_cost = {slot: len(_slot_header(slot)) + 1 for slot in _RENDER_SLOT_ORDER}
+
+    def _pack(budget: int) -> dict[str, Any]:
+        return pack_entries(
+            candidates,
+            budget=budget,
+            measure=lambda candidate: len(candidate["line"]) + 1,
+            group_of=lambda candidate: candidate["slot"],
+            group_cost=group_cost,
+            max_entries=max_items,
+        )
+
+    packed = _pack(available)
+    if packed["dropped_count"]:
+        # 只有真丢了才发那行提示，所以先按不预留跑一趟；真丢了再把提示长度扣掉
+        # 重跑一趟。预留宽度按"最多可能丢的件数"算，第二趟即使丢得更多也放得下。
+        packed = _pack(available - len(_wardrobe_notice(len(candidates))) - 1)
+    emitted_slots: set[str] = set()
+    for candidate in packed["kept"]:
+        slot = candidate["slot"]
+        if slot not in emitted_slots:
+            emitted_slots.add(slot)
+            lines.append(_slot_header(slot))
+        lines.append(candidate["line"])
+    if packed["dropped_count"]:
+        lines.append(_wardrobe_notice(packed["dropped_count"]))
     return _truncate_block("\n".join(lines), max_chars)
 
 
@@ -1536,21 +1602,40 @@ def _rotation_index(seed: str, size: int, rotation_days: Any) -> int:
     return order[offset]
 
 
+def _item_priority(row: Mapping[str, Any], *, fresh: bool = True) -> int:
+    """决策层 priority 在散件上的取值：已分类 > 未分类，有描述 > 无描述。
+
+    冷却（`recent_ids`）也参与打分，但真正的"绝不连穿两天"由
+    :func:`_pick_for_slot` 的**硬过滤**保证，见那里的说明。
+    """
+
+    return score_priority(
+        classified=bool(str(row.get("slot") or "")),
+        described=bool(str(row.get("description") or "").strip()),
+        fresh=fresh,
+    )
+
+
 def _pick_for_slot(
     candidates: Sequence[Mapping[str, Any]],
     *,
     seed: str,
     recent_ids: Collection[str],
 ) -> Mapping[str, Any] | None:
-    """Pick one item deterministically, preferring rows not worn recently."""
+    """Pick one item deterministically, preferring rows not worn recently.
+
+    冷却仍然是硬过滤：只要还有没穿过的，就只从没穿过的里挑 —— 打分不能把
+    "连着两天穿同一件"重新放回来。priority 决定的是**池内顺序**：有描述的排在
+    没描述的前面，其余仍按内容排序而不是按 id（即使 id 因某种原因不稳定，
+    例如手工改过配置，挑选顺序也保持一致，不会每轮换一套衣服）。
+    """
 
     if not candidates:
         return None
-    # 按内容排序而不是按 id：即使 id 因某种原因不稳定（例如手工改过配置），
-    # 挑选顺序也保持一致，不会每轮换一套衣服。
     ordered = sorted(
         candidates,
         key=lambda row: (
+            -_item_priority(row, fresh=str(row.get("id") or "") not in recent_ids),
             str(row.get("name") or ""),
             str(row.get("description") or ""),
             str(row.get("id") or ""),
@@ -1831,7 +1916,12 @@ def select_wardrobe_outfit(
         unclassified = [
             item for item in usable if not str(item.get("slot") or "")
         ]
-        unclassified.sort(key=lambda row: str(row.get("id") or ""))
+        # 兜底同样走 priority：先保有几句话可说的，再按 id 稳定排序 ——
+        # 同优先级时的顺序与旧实现逐字一致。
+        unclassified = sorted(
+            unclassified,
+            key=lambda row: (-_item_priority(row), str(row.get("id") or "")),
+        )
         picked_items = unclassified[:3]
     result = _compose("rule", picked_items)
     picked_ids = "-".join(str(item.get("id") or "") for item in picked_items)
