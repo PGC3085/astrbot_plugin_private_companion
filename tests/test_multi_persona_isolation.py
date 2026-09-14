@@ -7,10 +7,11 @@ from copy import deepcopy
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from quart import Quart
 
@@ -728,6 +729,58 @@ class MultiPersonaIsolationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("alt", scoped.persona_id)
             self.assertEqual("main", original.persona_id)
             self.assertIsNot(scoped, original)
+
+    @staticmethod
+    def _daily_review_scheduler_harness(plugin: PrivateCompanionPlugin) -> Mock:
+        plugin.enable_daily_review = True
+        plugin.daily_review_time = "04:00"
+        plugin.daily_review_provider_id = ""
+        plugin.troubleshooting_provider_id = ""
+        plugin.complex_reasoning_provider_id = ""
+        plugin.mai_style_provider_id = ""
+        plugin.llm_provider_id = ""
+        plugin._daily_review_generation_lock = asyncio.Lock()
+        plugin._tick = AsyncMock()
+        provider = Mock(return_value="")
+        plugin._task_provider = provider
+        plugin._resolve_chat_provider_id = Mock(return_value="")
+        plugin._save_data_sync = Mock()
+        plugin._scheduler_maintenance_tasks = lambda: (("每日巡视", plugin._ensure_daily_review),)
+        return provider
+
+    async def test_single_persona_maintenance_cycle_respects_review_backoff(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = _plugin_harness(root)
+            plugin.enable_multi_persona_mode = False
+            provider = self._daily_review_scheduler_harness(plugin)
+            plugin.data["daily_review_last_attempt"] = {
+                "status": "paused",
+                "attempted_at": time.time(),
+                "retry_after": time.time() + 3600,
+                "failure_count": 5,
+            }
+
+            await plugin._run_scheduler_cycle()
+
+            provider.assert_not_called()
+            self.assertEqual("paused", plugin.data["daily_review_last_attempt"]["status"])
+
+    async def test_multi_persona_maintenance_applies_backoff_per_persona(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = _plugin_harness(root)
+            provider = self._daily_review_scheduler_harness(plugin)
+            plugin._data_default["daily_review_last_attempt"] = {
+                "status": "failed",
+                "attempted_at": time.time(),
+                "retry_after": time.time() + 3600,
+                "failure_count": 1,
+            }
+
+            await plugin._run_scheduler_cycle()
+
+            provider.assert_called_once()
+            self.assertEqual("failed", plugin._data_default["daily_review_last_attempt"]["status"])
+            self.assertEqual("failed", plugin._persona_data_profiles["alt"]["daily_review_last_attempt"]["status"])
 
     async def test_disabled_mode_keeps_single_profile_behavior(self):
         with tempfile.TemporaryDirectory() as root:

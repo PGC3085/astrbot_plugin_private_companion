@@ -556,6 +556,45 @@ class DailyReviewTests(unittest.IsolatedAsyncioTestCase):
             states[4]["retry_after"] - states[4]["attempted_at"],
         )
 
+    async def test_every_automatic_entrypoint_respects_failure_backoff(self) -> None:
+        now = datetime(2026, 9, 1, 5, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.harness.data["daily_review_last_attempt"] = {
+            "date": "2026-08-30",
+            "status": "paused",
+            "attempted_at": now.timestamp() - 60,
+            "retry_after": now.timestamp() + 1800,
+            "failure_count": 5,
+        }
+
+        result = await self.harness._ensure_daily_review(
+            target_date="2026-08-30",
+            now=now,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(0, self.harness.llm_calls)
+        self.assertEqual("paused", self.harness.data["daily_review_last_attempt"]["status"])
+
+    async def test_manual_review_can_bypass_failure_backoff(self) -> None:
+        now = datetime(2026, 9, 1, 5, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.harness.data["daily_review_last_attempt"] = {
+            "date": "2026-08-30",
+            "status": "failed",
+            "attempted_at": now.timestamp(),
+            "retry_after": now.timestamp() + 1800,
+            "failure_count": 1,
+        }
+
+        report = await self.harness._ensure_daily_review(
+            force=True,
+            target_date="2026-08-30",
+            now=now,
+        )
+
+        self.assertIsInstance(report, dict)
+        self.assertEqual(1, self.harness.llm_calls)
+        self.assertEqual("completed", self.harness.data["daily_review_last_attempt"]["status"])
+
     async def test_scheduler_does_not_call_model_during_failure_backoff(self) -> None:
         self.harness._stop_event = asyncio.Event()
         self.harness.data["daily_review_last_attempt"] = {

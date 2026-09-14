@@ -198,6 +198,30 @@ class DailyReviewMixin:
             "error": self._daily_review_safe_text(error, 180),
         }
 
+    def _daily_review_retry_delay_seconds(
+        self,
+        attempt: Any = None,
+        *,
+        now: float | None = None,
+    ) -> float:
+        state = attempt if isinstance(attempt, dict) else self.data.get("daily_review_last_attempt")
+        if not isinstance(state, dict):
+            return 0.0
+        status = _single_line(state.get("status"), 16).lower()
+        if status not in {"failed", "paused"}:
+            return 0.0
+        current = time.time() if now is None else float(now)
+        retry_after = _safe_float(state.get("retry_after"), 0.0, 0.0)
+        if retry_after > 0:
+            return max(0.0, retry_after - current)
+        attempted_at = _safe_float(state.get("attempted_at"), 0.0, 0.0)
+        if attempted_at <= 0:
+            return 0.0
+        return max(
+            0.0,
+            self._DAILY_REVIEW_FAILURE_COOLDOWN_SECONDS - (current - attempted_at),
+        )
+
     def _daily_review_now(self, ts: float | None = None) -> datetime:
         timezone_name = _single_line(
             getattr(self, "environment_perception_timezone", "Asia/Shanghai"),
@@ -1361,6 +1385,12 @@ class DailyReviewMixin:
             if isinstance(existing, dict) and not force:
                 return existing
             previous_attempt = deepcopy(self.data.get("daily_review_last_attempt"))
+            current_ts = now.timestamp() if isinstance(now, datetime) else time.time()
+            if not force and self._daily_review_retry_delay_seconds(
+                previous_attempt,
+                now=current_ts,
+            ) > 0:
+                return None
             provider_id = self._task_provider(
                 self._daily_review_setting("daily_review_provider_id", ""),
                 self._daily_review_setting("troubleshooting_provider_id", ""),
@@ -1558,21 +1588,12 @@ class DailyReviewMixin:
         current = self._daily_review_now(now)
         target_date = self._daily_review_target_date(now=current)
         last_attempt = self.data.get("daily_review_last_attempt")
-        if isinstance(last_attempt, dict):
-            attempted_at = _safe_float(last_attempt.get("attempted_at"), 0.0, 0.0)
-            status = _single_line(last_attempt.get("status"), 16).lower()
-            if status in {"failed", "paused"} and attempted_at > 0:
-                retry_after = _safe_float(last_attempt.get("retry_after"), 0.0, 0.0)
-                if retry_after > 0:
-                    return max(0.0, retry_after - current.timestamp())
-                # Older persisted records have no retry_after. Keep their
-                # historical 30-minute cooldown without requiring a date
-                # match, since pending reviews may target older days.
-                return max(
-                    0.0,
-                    self._DAILY_REVIEW_FAILURE_COOLDOWN_SECONDS
-                    - (current.timestamp() - attempted_at),
-                )
+        retry_delay = self._daily_review_retry_delay_seconds(
+            last_attempt,
+            now=current.timestamp(),
+        )
+        if retry_delay > 0:
+            return retry_delay
         if self._daily_review_report_for_date(target_date) is None:
             return 0.0
         review_minutes = self._daily_review_minutes(self._daily_review_setting("daily_review_time", "04:00"))
