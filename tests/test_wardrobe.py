@@ -3612,6 +3612,9 @@ const HOOKS = [
   "[data-wardrobe-outfit-status]", "[data-wardrobe-outfit-add]",
   "[data-wardrobe-drafts]", "[data-wardrobe-draft-list]", "[data-wardrobe-drafts-count]",
   "[data-wardrobe-drafts-status]", "[data-wardrobe-drafts-refresh]", "[data-wardrobe-drafts-apply-all]",
+  "[data-wardrobe-intent]", "[data-wardrobe-intent-count]", "[data-wardrobe-intent-detail]",
+  "[data-wardrobe-intent-status]", "[data-wardrobe-intent-refresh]", "[data-wardrobe-intent-clear]",
+  "[data-wardrobe-intent-clear-status]",
 ];
 
 function buildContext(settings, responses, seeds) {
@@ -3624,6 +3627,7 @@ function buildContext(settings, responses, seeds) {
   });
   Object.keys(seeds || {}).forEach((hook) => { if (els[hook]) els[hook].value = seeds[hook]; });
   els["[data-wardrobe-drafts]"].open = false;
+  els["[data-wardrobe-intent]"].open = false;
   const calls = [];
   const postJson = async (path, body) => {
     calls.push({ path, body });
@@ -4099,3 +4103,417 @@ report.calls = built.calls.map((call) => call.path);
         self.assertIn("没有可确认的草稿", out["status"])
         self.assertEqual("error", out["tone"])
         self.assertEqual(["/wardrobe/drafts"], out["calls"])
+
+# ---------------------------------------------------------------------------
+# Q. 穿衣意图：页面接口
+# ---------------------------------------------------------------------------
+
+
+class WardrobeIntentEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """POST /wardrobe/intent 与 /wardrobe/intent-clear。
+
+    与草稿队列同一套路：直接替换 page_api.request（这两个接口都不需要请求体），
+    用例在缺 Quart 桩的环境里也能真正跑起来。
+    """
+
+    SNAPSHOT = {
+        "instruction": "换上泳衣",
+        "source": "model_tool",
+        "date": "2026-02-11",
+        "created_at": 1770000000.0,
+        "expires_at": 1770043200.0,
+        "outfit_id": "",
+        "outfit_name": "",
+        "items": [{"id": "item_xxx", "name": "分体泳衣上装", "slot": "upper"}],
+    }
+
+    def _api(self, plugin):
+        from astrbot_plugin_private_companion.page_api import PrivateCompanionPageApi
+
+        return PrivateCompanionPageApi(plugin)
+
+    def _request(self, payload=None):
+        import sys
+        from unittest import mock
+
+        from astrbot_plugin_private_companion.page_api import PrivateCompanionPageApi
+
+        namespace = vars(sys.modules[PrivateCompanionPageApi.__module__])
+        return mock.patch.dict(namespace, {"request": _FakePageRequest(payload)})
+
+    def _intent_plugin(self, *, snapshot=None, cleared=False):
+        class _Plugin:
+            def __init__(self) -> None:
+                self.snapshot_calls = 0
+                self.clear_calls = 0
+
+            def _wardrobe_intent_snapshot(self):
+                self.snapshot_calls += 1
+                return dict(snapshot or {})
+
+            def _wardrobe_clear_intent(self):
+                self.clear_calls += 1
+                return cleared
+
+        return _Plugin()
+
+    # --- 读取 ---
+
+    async def test_intent_endpoint_returns_the_snapshot(self) -> None:
+        plugin = self._intent_plugin(snapshot=self.SNAPSHOT)
+        with self._request({}):
+            result = await self._api(plugin).get_wardrobe_intent()
+        self.assertTrue(result["success"])
+        self.assertEqual(self.SNAPSHOT, result["data"]["intent"])
+        self.assertEqual(1, plugin.snapshot_calls)
+
+    async def test_intent_endpoint_reports_an_empty_snapshot(self) -> None:
+        plugin = self._intent_plugin()
+        with self._request({}):
+            result = await self._api(plugin).get_wardrobe_intent()
+        self.assertTrue(result["success"])
+        self.assertEqual({}, result["data"]["intent"])
+
+    async def test_intent_endpoint_does_not_require_a_body(self) -> None:
+        plugin = self._intent_plugin(snapshot=self.SNAPSHOT)
+        for payload in ({}, None, "不是对象"):
+            with self.subTest(payload=payload):
+                with self._request(payload):
+                    result = await self._api(plugin).get_wardrobe_intent()
+                self.assertTrue(result["success"])
+
+    async def test_intent_endpoint_reports_missing_capability(self) -> None:
+        with self._request({}):
+            result = await self._api(SimpleNamespace(data_dir="/tmp")).get_wardrobe_intent()
+        self.assertFalse(result["success"])
+        self.assertIn("不支持穿衣意图", json.dumps(result, ensure_ascii=False))
+
+    async def test_intent_endpoint_survives_a_raising_reader(self) -> None:
+        class _Raising:
+            def _wardrobe_intent_snapshot(self):
+                raise RuntimeError("override exploded")
+
+        with self._request({}):
+            result = await self._api(_Raising()).get_wardrobe_intent()
+        self.assertFalse(result["success"])
+        self.assertIn("读取穿衣意图失败", json.dumps(result, ensure_ascii=False))
+
+    async def test_intent_endpoint_drops_a_non_mapping_snapshot(self) -> None:
+        plugin = self._intent_plugin()
+        plugin._wardrobe_intent_snapshot = lambda: ["不是", "字典"]
+        with self._request({}):
+            result = await self._api(plugin).get_wardrobe_intent()
+        self.assertTrue(result["success"])
+        self.assertEqual({}, result["data"]["intent"])
+
+    # --- 清除 ---
+
+    async def test_intent_clear_reports_true_when_something_was_cleared(self) -> None:
+        plugin = self._intent_plugin(cleared=True)
+        with self._request({}):
+            result = await self._api(plugin).clear_wardrobe_intent()
+        self.assertTrue(result["success"])
+        self.assertIs(True, result["data"]["cleared"])
+        self.assertEqual(1, plugin.clear_calls)
+
+    async def test_intent_clear_reports_false_when_there_was_nothing(self) -> None:
+        plugin = self._intent_plugin(cleared=False)
+        with self._request({}):
+            result = await self._api(plugin).clear_wardrobe_intent()
+        self.assertTrue(result["success"])
+        self.assertIs(False, result["data"]["cleared"])
+        self.assertEqual(1, plugin.clear_calls)
+
+    async def test_intent_clear_reports_missing_capability(self) -> None:
+        with self._request({}):
+            result = await self._api(SimpleNamespace(data_dir="/tmp")).clear_wardrobe_intent()
+        self.assertFalse(result["success"])
+        self.assertIn("不支持穿衣意图", json.dumps(result, ensure_ascii=False))
+
+    async def test_intent_clear_survives_a_raising_clearer(self) -> None:
+        class _Raising:
+            def _wardrobe_clear_intent(self):
+                raise RuntimeError("override exploded")
+
+        with self._request({}):
+            result = await self._api(_Raising()).clear_wardrobe_intent()
+        self.assertFalse(result["success"])
+        self.assertIn("清除穿衣意图失败", json.dumps(result, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# R. 面板：今天的穿衣意图
+# ---------------------------------------------------------------------------
+
+
+class WardrobeIntentPanelTests(unittest.TestCase):
+    PANEL_DIRS = ("companion-panel", "陪伴面板")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.htmls: list[str] = []
+        cls.styles: list[str] = []
+        for name in cls.PANEL_DIRS:
+            base = ROOT / "pages" / name
+            cls.htmls.append((base / "index.html").read_text(encoding="utf-8"))
+            cls.styles.append((base / "app.css").read_text(encoding="utf-8"))
+        cls.module = (ROOT / "pages" / "companion-panel" / "js" / "features" / "wardrobe.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_panel_copies_stay_byte_identical(self) -> None:
+        for relative in ("index.html", "app.css", "js/features/wardrobe.js"):
+            first = (ROOT / "pages" / "companion-panel" / relative).read_bytes()
+            second = (ROOT / "pages" / "陪伴面板" / relative).read_bytes()
+            self.assertEqual(first, second, relative)
+
+    def test_html_exposes_the_intent_block(self) -> None:
+        for html in self.htmls:
+            self.assertIn('<details class="wardrobe-intent" data-wardrobe-intent>', html)
+            self.assertIn("data-wardrobe-intent-count", html)
+            self.assertIn("data-wardrobe-intent-detail", html)
+            self.assertIn("data-wardrobe-intent-refresh", html)
+            self.assertIn("data-wardrobe-intent-clear", html)
+            # 两块状态文案都要能读屏：状态 span 必须带 aria-live。
+            self.assertIn("data-wardrobe-intent-status", html)
+            self.assertIn('data-wardrobe-intent-status aria-live="polite"', html)
+            # 两个按钮各带一个 aria-live 状态区（读取与清除的消息互不覆盖）。
+            self.assertIn('data-wardrobe-intent-status aria-live="polite"', html)
+            self.assertIn('data-wardrobe-intent-clear-status aria-live="polite"', html)
+            # 展开前就写明状态：badge 未读取、清除按钮不可点。
+            self.assertIn("data-wardrobe-intent-count>未读取</span>", html)
+            self.assertIn("data-wardrobe-intent-clear disabled", html)
+
+    def test_intent_block_sits_between_outfits_and_drafts(self) -> None:
+        for html in self.htmls:
+            outfits = html.index("data-wardrobe-outfit-manager")
+            intent = html.index("data-wardrobe-intent")
+            drafts = html.index('class="wardrobe-drafts"')
+            self.assertLess(outfits, intent)
+            self.assertLess(intent, drafts)
+
+    def test_cache_buster_is_bumped(self) -> None:
+        for html in self.htmls:
+            self.assertIn("js/features/wardrobe.js?v=20260910-wardrobe-v3", html)
+            self.assertNotIn("wardrobe-v2", html)
+
+    def test_module_only_calls_registered_endpoints(self) -> None:
+        api = (ROOT / "page_api.py").read_text(encoding="utf-8")
+        for route in ("/wardrobe/intent", "/wardrobe/intent-clear"):
+            self.assertIn('postJson("%s"' % route, self.module, route)
+            self.assertIn('("%s"' % route, api, route)
+
+    def test_module_renders_intent_without_inner_html(self) -> None:
+        # 既有面板一律 textContent + createElement，意图块不能破例。
+        self.assertNotIn("innerHTML", self.module)
+        for selector in (
+            "[data-wardrobe-intent]",
+            "[data-wardrobe-intent-count]",
+            "[data-wardrobe-intent-detail]",
+            "[data-wardrobe-intent-status]",
+        ):
+            self.assertIn(selector, self.module, selector)
+
+    def test_intent_refreshes_only_while_expanded(self) -> None:
+        self.assertIn('querySelector("[data-wardrobe-intent]")?.open === true', self.module)
+        self.assertIn("if (root.open) void refreshIntent(context);", self.module)
+
+    def test_styles_cover_the_appended_intent_classes(self) -> None:
+        for style in self.styles:
+            for selector in (
+                ".wardrobe-intent {",
+                ".wardrobe-intent > summary {",
+                ".wardrobe-intent-count {",
+                ".wardrobe-intent-body {",
+                ".wardrobe-intent-actions {",
+                ".wardrobe-intent-action {",
+                ".wardrobe-intent-detail {",
+                ".wardrobe-intent-note {",
+                ".wardrobe-intent-meta {",
+                ".wardrobe-intent-items {",
+                ".wardrobe-intent-item {",
+            ):
+                self.assertIn(selector, style, selector)
+
+
+class WardrobeIntentPanelRuntimeTests(unittest.TestCase):
+    """用 Node 实际执行面板模块，验证意图块的读取、清除与状态文案。"""
+
+    MODULE = ROOT / "pages" / "陪伴面板" / "js" / "features" / "wardrobe.js"
+    _HARNESS = WardrobeOutfitDraftPanelRuntimeTests._HARNESS
+    _run = WardrobeOutfitDraftPanelRuntimeTests._run
+
+    SNAPSHOT = {
+        "instruction": "换上泳衣",
+        "source": "model_tool",
+        "date": "2026-02-11",
+        "created_at": 1770000000.0,
+        "expires_at": 1770043200.0,
+        "outfit_id": "",
+        "outfit_name": "",
+        "items": [
+            {"id": "item_xxx", "name": "分体泳衣上装", "slot": "upper"},
+            {"id": "item_yyy", "name": "沙滩短裤", "slot": "lower"},
+        ],
+    }
+
+    _COLLECT = """
+function allText(node) {
+  let out = node.textContent || "";
+  (node.children || []).forEach((child) => { out += allText(child); });
+  return out;
+}
+"""
+
+    def _intent_response(self, snapshot=None):
+        return {"success": True, "data": {"intent": snapshot if snapshot is not None else self.SNAPSHOT}}
+
+    def test_hydration_does_not_fetch_while_collapsed(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {"/wardrobe/intent": self._intent_response()},
+            """
+report.calls = built.calls.map((call) => call.path);
+""",
+        )
+        self.assertEqual(["/wardrobe/drafts"], out["calls"], "没展开就不该发意图请求")
+
+    def test_toggle_renders_the_intent(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {"/wardrobe/intent": self._intent_response()},
+            self._COLLECT
+            + """
+const root = built.els["[data-wardrobe-intent]"];
+root.open = true;
+root.dispatch("toggle", {});
+await settle();
+report.badge = built.els["[data-wardrobe-intent-count]"].textContent;
+report.status = built.els["[data-wardrobe-intent-status]"].textContent;
+report.tone = built.els["[data-wardrobe-intent-status]"].dataset.tone;
+report.text = allText(built.els["[data-wardrobe-intent-detail]"]);
+report.clearDisabled = built.els["[data-wardrobe-intent-clear]"].disabled;
+report.calls = built.calls.map((call) => call.path);
+""",
+        )
+        self.assertEqual(["有 · 模型记录"], [out["badge"]])
+        self.assertIn("换上泳衣", out["text"])
+        self.assertIn("分体泳衣上装 · 上身", out["text"])
+        self.assertIn("沙滩短裤 · 下身", out["text"])
+        self.assertIn("模型记录", out["text"])
+        self.assertRegex(out["text"], r"\d{2}:\d{2}")
+        self.assertFalse(out["clearDisabled"])
+        self.assertEqual("ok", out["tone"])
+        # 衣柜本身在 hydrate 时拉一次草稿队列；意图只多了一次自己的读取。
+        self.assertEqual(["/wardrobe/drafts", "/wardrobe/intent"], out["calls"])
+
+    def test_toggle_without_an_intent_disables_the_clear_button(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {"/wardrobe/intent": self._intent_response({})},
+            self._COLLECT
+            + """
+const root = built.els["[data-wardrobe-intent]"];
+root.open = true;
+root.dispatch("toggle", {});
+await settle();
+report.badge = built.els["[data-wardrobe-intent-count]"].textContent;
+report.text = allText(built.els["[data-wardrobe-intent-detail]"]);
+report.clearDisabled = built.els["[data-wardrobe-intent-clear]"].disabled;
+""",
+        )
+        self.assertEqual("无", out["badge"])
+        self.assertIn("当前没有额外指定，按当天轮换着装", out["text"])
+        self.assertTrue(out["clearDisabled"])
+
+    def test_refresh_button_fetches_again(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {"/wardrobe/intent": self._intent_response()},
+            self._COLLECT
+            + """
+const root = built.els["[data-wardrobe-intent]"];
+root.open = true;
+root.dispatch("toggle", {});
+await settle();
+root.dispatch("click", { target: built.els["[data-wardrobe-intent-refresh]"] });
+await settle();
+report.badge = built.els["[data-wardrobe-intent-count]"].textContent;
+report.calls = built.calls.map((call) => call.path);
+""",
+        )
+        self.assertEqual("有 · 模型记录", out["badge"])
+        self.assertEqual(["/wardrobe/drafts", "/wardrobe/intent", "/wardrobe/intent"], out["calls"])
+
+    def test_clear_refreshes_the_block_and_reports_success(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {
+                "/wardrobe/intent": self._intent_response(),
+                "/wardrobe/intent-clear": {"success": True, "data": {"cleared": True}},
+            },
+            self._COLLECT
+            + """
+const root = built.els["[data-wardrobe-intent]"];
+root.open = true;
+root.dispatch("toggle", {});
+await settle();
+root.dispatch("click", { target: built.els["[data-wardrobe-intent-clear]"] });
+await settle();
+report.status = built.els["[data-wardrobe-intent-clear-status]"].textContent;
+report.tone = built.els["[data-wardrobe-intent-clear-status]"].dataset.tone;
+report.readStatus = built.els["[data-wardrobe-intent-status]"].textContent;
+report.clearBody = built.calls.filter((call) => call.path === "/wardrobe/intent-clear").map((call) => call.body);
+report.calls = built.calls.map((call) => call.path);
+""",
+        )
+        self.assertIn("已清除", out["status"])
+        self.assertEqual("ok", out["tone"])
+        # 快照已经变了，读取区的旧文案不能再留着。
+        self.assertEqual("", out["readStatus"])
+        self.assertEqual([{}], out["clearBody"])
+        # 清除后必须重读一次快照（badge 与列表都跟着快照走）。
+        self.assertEqual(
+            ["/wardrobe/drafts", "/wardrobe/intent", "/wardrobe/intent-clear", "/wardrobe/intent"],
+            out["calls"],
+        )
+
+    def test_clear_reports_nothing_to_clear(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {
+                "/wardrobe/intent": self._intent_response(),
+                "/wardrobe/intent-clear": {"success": True, "data": {"cleared": False}},
+            },
+            """
+const root = built.els["[data-wardrobe-intent]"];
+root.open = true;
+root.dispatch("toggle", {});
+await settle();
+root.dispatch("click", { target: built.els["[data-wardrobe-intent-clear]"] });
+await settle();
+report.status = built.els["[data-wardrobe-intent-clear-status]"].textContent;
+""",
+        )
+        self.assertIn("本来就没有穿衣意图", out["status"])
+
+    def test_backend_error_text_lands_in_the_status_span(self) -> None:
+        out = self._run(
+            {"wardrobe_items": [], "wardrobe_outfits": []},
+            {
+                "/wardrobe/intent": self._intent_response(),
+                "/wardrobe/intent-clear": {"__error__": "当前插件实例不支持穿衣意图"},
+            },
+            """
+const root = built.els["[data-wardrobe-intent]"];
+root.open = true;
+root.dispatch("toggle", {});
+await settle();
+root.dispatch("click", { target: built.els["[data-wardrobe-intent-clear]"] });
+await settle();
+report.status = built.els["[data-wardrobe-intent-clear-status]"].textContent;
+report.tone = built.els["[data-wardrobe-intent-clear-status]"].dataset.tone;
+""",
+        )
+        self.assertEqual("当前插件实例不支持穿衣意图", out["status"])
+        self.assertEqual("error", out["tone"])

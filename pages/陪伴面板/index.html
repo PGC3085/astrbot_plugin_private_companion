@@ -635,6 +635,25 @@
                 </div>
                 <input type="hidden" name="wardrobe_outfits" data-wardrobe-outfits-input value="[]" />
               </div>
+              <details class="wardrobe-intent" data-wardrobe-intent>
+                <summary>
+                  <span><b>今天的穿衣意图</b><small>本会话临时指定的着装，优先于当天轮换。</small></span>
+                  <span class="wardrobe-intent-count" data-wardrobe-intent-count>未读取</span>
+                </summary>
+                <div class="wardrobe-intent-body">
+                  <div class="wardrobe-intent-actions">
+                    <div class="wardrobe-intent-action">
+                      <button type="button" class="secondary-button" data-wardrobe-intent-refresh>刷新</button>
+                      <span class="wardrobe-status" data-wardrobe-intent-status aria-live="polite"></span>
+                    </div>
+                    <div class="wardrobe-intent-action">
+                      <button type="button" class="secondary-button" data-wardrobe-intent-clear disabled>清除意图</button>
+                      <span class="wardrobe-status" data-wardrobe-intent-clear-status aria-live="polite"></span>
+                    </div>
+                  </div>
+                  <div class="wardrobe-intent-detail" data-wardrobe-intent-detail></div>
+                </div>
+              </details>
               <details class="wardrobe-drafts" data-wardrobe-drafts>
                 <summary>
                   <span><b>草稿队列</b><small>批量导入与识图只写草稿；确认才落库，丢弃只标记素材。</small></span>
@@ -2443,7 +2462,7 @@ QQ空间 = 公开札记
   </div>
 
   <script src="./js/features/daily-outfit.js?v=20260711-qzone-preview-context"></script>
-  <script src="./js/features/wardrobe.js?v=20260910-wardrobe-v2"></script>
+  <script src="./js/features/wardrobe.js?v=20260910-wardrobe-v3"></script>
   <script src="./js/ui/appearance.js?v=20260713-font-options"></script>
   <!-- Loaded on demand by app.js through AstrBot's relative dynamic-import rewriting:
        ./js/panels/provider-tree.js?v=20260804-reading-archive-capability-v1&amp;manual=provider-input-v2&amp;layout=v2&amp;vision-state=v1
