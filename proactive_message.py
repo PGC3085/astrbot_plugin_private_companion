@@ -18587,10 +18587,12 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         motive: str = "",
         action_summary: str = "",
     ) -> str:
-        # AstrBot history is stored as user/assistant pairs. Keep the synthetic
-        # user side empty so an implementation detail can never appear in the
-        # conversation UI or be echoed by a later model response.
-        return ""
+        # AstrBot history is stored as user/assistant pairs. Return the
+        # placeholder marker so archiving takes the context-only branch and
+        # appends only the assistant message; the marker itself never lands
+        # in conversation history, keeping the synthetic user side truly
+        # neutral and never visible to the model.
+        return "【主动承接占位】"
 
     @staticmethod
     def _proactive_component_is_image(component: Any) -> bool:
