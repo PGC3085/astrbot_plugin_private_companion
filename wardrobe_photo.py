@@ -10,7 +10,7 @@
 
 1. **只读**：不改配置、不调模型、不写缓存；
 2. **失败即回落**：任何异常都返回 {}，照片链路不能因为我们挂掉而中断；
-3. **可关**：wardrobe_photo_source = wardrobe（默认）| builtin（关闭接管）。
+3. **默认不接管**：wardrobe_photo_source = builtin（默认，沿用作者候选表）| wardrobe（主动开启接管）。
 """
 
 from __future__ import annotations
@@ -65,10 +65,14 @@ def wardrobe_photo_source(host: Any) -> str:
     raw = ""
     if callable(getter):
         try:
-            raw = str(getter("wardrobe_photo_source", WARDROBE_PHOTO_SOURCE_WARDROBE) or "")
+            raw = str(getter("wardrobe_photo_source", WARDROBE_PHOTO_SOURCE_BUILTIN) or "")
         except Exception:
             raw = ""
-    return WARDROBE_PHOTO_SOURCE_BUILTIN if raw.strip().casefold() == WARDROBE_PHOTO_SOURCE_BUILTIN else WARDROBE_PHOTO_SOURCE_WARDROBE
+    # 只有**明确写了** wardrobe（或「衣柜」）才接管；缺省、空值、拼错一律不接管。
+    clean = raw.strip().casefold()
+    if clean in {"wardrobe", "衣柜", "跟随衣柜"}:
+        return WARDROBE_PHOTO_SOURCE_WARDROBE
+    return WARDROBE_PHOTO_SOURCE_BUILTIN
 
 
 def _dialogue_intent_profile(host: Any) -> dict[str, str]:

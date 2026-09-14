@@ -18,7 +18,9 @@ class _Host:
     """最小替身：只实现桥接会用到的那几个读取口。"""
 
     def __init__(self, **overrides):
-        self.setting = overrides.pop("setting", {})
+        # 默认按「用户已主动把照片来源切到衣柜」构造：本文件大多数用例测的是接管后的
+        # 行为。想验真实默认值的用例显式传 setting={}（默认 builtin，不接管）。
+        self.setting = overrides.pop("setting", {"wardrobe_photo_source": "wardrobe"})
         self.items = overrides.pop("items", [
             {"id": "w_top", "name": "米色针织开衫", "description": "宽松细针织", "slot": "upper"},
             {"id": "w_bottom", "name": "深色直筒长裤", "slot": "lower"},
@@ -110,10 +112,23 @@ class WardrobePhotoIntentTests(unittest.TestCase):
 
 
 class WardrobePhotoBridgeTests(unittest.TestCase):
-    def test_default_source_is_wardrobe(self) -> None:
-        self.assertEqual("wardrobe", wardrobe_photo_source(_Host()))
-        self.assertEqual(WARDROBE_PHOTO_SOURCE_BUILTIN,
-                         wardrobe_photo_source(_Host(setting={"wardrobe_photo_source": "builtin"})))
+    def test_default_source_is_builtin(self) -> None:
+        # 默认不接管：升级后行为不变，要跟随衣柜得用户主动开。
+        self.assertEqual(WARDROBE_PHOTO_SOURCE_BUILTIN, wardrobe_photo_source(_Host(setting={})))
+        # 只有明确写了 wardrobe（或「衣柜」）才接管。
+        self.assertEqual("wardrobe", wardrobe_photo_source(_Host(setting={"wardrobe_photo_source": "wardrobe"})))
+        self.assertEqual("wardrobe", wardrobe_photo_source(_Host(setting={"wardrobe_photo_source": "衣柜"})))
+        # 拼错、空值、旧的 built-in 写法一律不接管。
+        for junk in ("", "  ", "wardrob", "built-in", "内置", None):
+            self.assertEqual(
+                WARDROBE_PHOTO_SOURCE_BUILTIN,
+                wardrobe_photo_source(_Host(setting={"wardrobe_photo_source": junk})),
+                junk,
+            )
+
+    def test_default_builtin_means_no_takeover(self) -> None:
+        # 默认值下整条链路直接交还作者候选表。
+        self.assertEqual({}, resolve_daily_outfit_profile(_Host(setting={})))
 
     def test_profile_carries_the_fields_the_author_was_dropping(self) -> None:
         profile = resolve_daily_outfit_profile(_Host())

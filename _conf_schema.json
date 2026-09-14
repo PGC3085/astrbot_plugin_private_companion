@@ -14453,10 +14453,10 @@
       "wardrobe_photo_source": {
         "description": "每日穿搭照片的衣着来源",
         "type": "string",
-        "options": ["wardrobe", "builtin"],
-        "labels": ["用衣柜裁决的那一套", "沿用插件自带候选表"],
-        "hint": "wardrobe：每日穿搭照片改穿衣柜里裁决出的那一套（含 footwear 等字段）；builtin：沿用插件原有的场景候选表。衣柜为空时自动回落。",
-        "default": "wardrobe",
+        "options": ["builtin", "wardrobe"],
+        "labels": ["沿用插件自带候选表（默认）", "用衣柜裁决的那一套"],
+        "hint": "builtin（默认）：沿用插件原有的场景候选表，升级后行为不变；wardrobe：每日穿搭照片改穿衣柜里裁决出的那一套（含 footwear 等字段），需要主动开启。衣柜为空时自动回落。",
+        "default": "builtin",
         "condition": {
           "enable_wardrobe": true
         }

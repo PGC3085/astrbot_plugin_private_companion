@@ -556,10 +556,10 @@ class PageSettingNormalizerMixin:
         if key == "wardrobe_outfits":
             return normalize_wardrobe_outfits(value)
         if key == "wardrobe_photo_source":
-            # 只有明确写了 builtin 才交还给作者的候选表，其余（含空/拼错）一律默认接管，
-            # 与 _conf_schema.json 的默认值一致。
+            # 默认不接管：只有明确写了 wardrobe（或「衣柜」）才交给衣柜，
+            # 其余（含空值、拼错、旧的 built-in 写法）一律沿用作者候选表。
             raw_source = str(value or "").strip().casefold()
-            return "builtin" if raw_source in {"builtin", "built-in", "内置"} else "wardrobe"
+            return "wardrobe" if raw_source in {"wardrobe", "衣柜", "跟随衣柜"} else "builtin"
         if key == "wardrobe_outfit_mode":
             return "select" if str(value or "").strip().casefold() == "select" else "inventory"
         if key == "wardrobe_injection_detail":
