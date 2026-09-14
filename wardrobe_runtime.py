@@ -70,6 +70,7 @@ from .wardrobe import (
     render_wardrobe_outfit_prompt,
     render_wardrobe_prompt,
     render_worn_items,
+    truncate_wardrobe_text,
     select_wardrobe_outfit,
     update_wardrobe_item,
     update_wardrobe_outfit,
@@ -550,6 +551,9 @@ class WardrobeMixin:
             item = by_id.get(key)
             if item is None or key in seen:
                 return
+            if str(item.get("ownership") or OWNERSHIP_OWNED) != OWNERSHIP_OWNED:
+                # 早期写入可能带上了参考件：渲染时同样不认，免得「参考被穿上身」。
+                return
             seen.add(key)
             picked.append(item)
 
@@ -596,7 +600,8 @@ class WardrobeMixin:
                 "衣柜清单里没有完全对应的衣物：按剧情临时服装处理，"
                 "不要用清单里的默认搭配把它换回来，也不要声称它出自衣柜。"
             )
-        return chr(10).join(lines)
+        # 整个段落（含前言）封顶：override 路径原先没有任何上限，12 件长描述实测能到 1908。
+        return truncate_wardrobe_text(chr(10).join(lines), WARDROBE_PROMPT_MAX_CHARS)
 
     def _wardrobe_override_snapshot(self, user_id: str = "") -> dict[str, Any]:
         """原样读作者那套 override（不做身份过滤）；取不到返回 {}。"""
@@ -655,6 +660,17 @@ class WardrobeMixin:
     def _wardrobe_intent_tokens(raw: Any) -> list[str]:
         """把工具传来的那一串名称/id 拆开：逗号、顿号、斜杠、分号、换行都算分隔符。"""
 
+        # 模型可能把 items 传成数组（AstrBot 只按参数名过滤、不做类型校验），
+        # 直接 _single_line(list) 会得到 "['分体泳衣上装']" 这种乱码，解析必然失败
+        # 却仍然回 ok=true —— 那会让提示词说「衣柜里没有这件」。先展开成文本。
+        if isinstance(raw, (list, tuple, set)):
+            parts: list[str] = []
+            for entry in raw:
+                if isinstance(entry, Mapping):
+                    parts.append(str(entry.get("name") or entry.get("id") or ""))
+                else:
+                    parts.append(str(entry or ""))
+            raw = "，".join(parts)
         text = _single_line(raw, 600)
         if not text:
             return []
@@ -674,13 +690,15 @@ class WardrobeMixin:
         只认 id、完整名称、以及**唯一**的子串命中 —— 挑错衣服比挑不到更糟。
         """
 
-        wardrobe_items = self._wardrobe_items()
+        # 只在**自有**散件里解析：ownership=reference 是别人的穿搭灵感，
+        # 不该被点名成「正在穿」（与 _wardrobe_owned_items 的声明一致）。
+        wardrobe_items = self._wardrobe_owned_items()
         by_id = {str(row.get("id") or ""): row for row in wardrobe_items}
-        by_name: dict[str, dict[str, Any]] = {}
+        by_name: dict[str, list[dict[str, Any]]] = {}
         for row in wardrobe_items:
             key = str(row.get("name") or "").strip().casefold()
             if key:
-                by_name.setdefault(key, row)
+                by_name.setdefault(key, []).append(row)
         outfit_rows = self._wardrobe_outfits()
         outfits_by_id = {str(row.get("id") or ""): row for row in outfit_rows}
         outfits_by_name: dict[str, dict[str, Any]] = {}
@@ -692,7 +710,11 @@ class WardrobeMixin:
         picked: list[dict[str, Any]] = []
         unresolved: list[str] = []
         for token in self._wardrobe_intent_tokens(items):
-            row = by_id.get(token) or by_name.get(token.casefold())
+            row = by_id.get(token)
+            if row is None:
+                # 同名两件必须判未命中：与子串歧义同一套「挑错衣服比挑不到更糟」。
+                same_name = by_name.get(token.casefold()) or []
+                row = same_name[0] if len(same_name) == 1 else None
             if row is None:
                 needle = token.casefold()
                 matches = [
@@ -752,6 +774,21 @@ class WardrobeMixin:
         data = getattr(self, "data", None)
         if not isinstance(data, dict):
             outcome["error"] = "当前运行时不支持记录穿衣意图。"
+            return outcome
+        # 门禁：作者那条写同一个 key 的路径只认主要用户（daily_state 里
+        # `_private_user_role(user) != "owner"` 直接返回）。这条 key 是全局的
+        # （生图与面板读的是不带用户过滤的那一份），放任任何人群里喊一句就覆盖，
+        # 等于把主人的意图静默清空、让照片按别人的要求穿。**取不到角色判定时一律拒绝**。
+        role_getter = getattr(self, "_private_user_role", None)
+        role = ""
+        if callable(role_getter):
+            try:
+                role = _single_line(role_getter(user), 24)
+            except Exception:
+                role = ""
+        if role != "owner":
+            logger.info("衣柜穿衣意图写入被拒（非主要用户）: role=%s", role or "unknown")
+            outcome["error"] = "只有主要用户可以改变角色今天的着装。"
             return outcome
         picked, unresolved, outfit_id, outfit_name = self._wardrobe_resolve_intent(items, outfit)
         clean_intent = _single_line(intent, 180)
@@ -1362,6 +1399,33 @@ class WardrobeMixin:
             payload["text"] = "\n".join(parts)
             payload["truncated"] = truncated
             return payload
+        # 与提示词**同源**：本会话明确换装优先。否则工具会报「轮换裁决那一套」，
+        # 而同一轮提示词写着「当前着装以这次换装为准」—— 模型按提示来问一次，
+        # 反而被带回相反的答案（P0 刚消掉的两段冲突会从工具路径复现）。
+        override = self._wardrobe_dialogue_override(user)
+        if override:
+            override_items = self._wardrobe_override_items(override)
+            override_parts: list[str] = []
+            instruction = _single_line(override.get("instruction"), 180)
+            if instruction:
+                override_parts.append(f"本会话已明确换装：{instruction}")
+            override_lines, override_truncated = self._wardrobe_detail_lines(
+                override_items,
+                limit_items=WARDROBE_DETAIL_MAX_ITEMS,
+                limit_chars=WARDROBE_DETAIL_MAX_CHARS,
+            )
+            if override_lines:
+                override_parts.append("当前这身：" + chr(10) + chr(10).join(override_lines))
+            else:
+                override_parts.append(
+                    "衣柜清单里没有完全对应的衣物：按剧情临时服装处理，"
+                    "不要用清单里的默认搭配换回来。"
+                )
+            payload["count"] = len(override_items)
+            payload["text"] = chr(10).join(override_parts)
+            payload["truncated"] = override_truncated
+            payload["source"] = "dialogue_override"
+            return payload
         selection = self._wardrobe_outfit_selection(user)
         picked_ids = {str(row.get("id") or "") for row in (selection.get("picked") or ())}
         picked = [item for item in items if str(item.get("id") or "") in picked_ids]
@@ -1402,18 +1466,6 @@ class WardrobeMixin:
             return json.dumps({"status": "error", "text": "读取衣柜细节失败。"}, ensure_ascii=False)
         return json.dumps(payload, ensure_ascii=False)
 
-    def _wardrobe_detail_tool(self) -> Any:
-        """取宿主里已注册的那个工具对象（注册在 main.py 的 @filter.llm_tool）。"""
-
-        try:
-            from astrbot.core.provider.register import llm_tools
-        except Exception:
-            return None
-        try:
-            return llm_tools.get_func(WARDROBE_DETAIL_TOOL_NAME)
-        except Exception:
-            return None
-
     def _sync_wardrobe_detail_tool(self, req: Any) -> bool:
         """按请求挂载/摘下衣柜细节工具，返回「这次请求模型能不能调用它」。
 
@@ -1423,9 +1475,11 @@ class WardrobeMixin:
           （req.func_tool 是有 tools 列表的 ToolSet）。为 None 说明本次没有启用
           function calling（例如模型不支持），这时不新建工具表去改变宿主行为。
 
-        已知取舍：如果用户在人格里配了 tools 白名单刻意排除本工具，这里仍会把它补
-        回去 —— 因为同一轮我们已经在提示词里写了这件工具（WARDROBE_DETAIL_TOOL_HINT），
-        提示词与工具表必须一致，否则模型会照着提示词凭空「调用」一个不存在的工具。
+        **只「摘」不「挂」**：宿主本来就会按工具自身的 active 状态、人格 tools 白名单
+        与 tool_permissions 决定这次请求带哪些工具。我们若把自己取的原始对象塞回去，
+        会 a) 复活管理员已经在后台停用的工具（get_func 在没有 active 同名工具时会
+        退化返回 inactive 对象），b) 绕过 _PermissionGuardedTool 的权限代理，
+        把「仅管理员」的工具对所有人开放。所以这里只回答「在不在」，不改变工具表。
         """
 
         tool_set = getattr(req, "func_tool", None)
@@ -1442,22 +1496,7 @@ class WardrobeMixin:
                     if getattr(tool, "name", "") != WARDROBE_DETAIL_TOOL_NAME
                 ]
             return False
-        if present:
-            return True
-        tool = self._wardrobe_detail_tool()
-        if tool is None:
-            logger.debug("衣柜细节工具没有注册，跳过挂载")
-            return False
-        adder = getattr(tool_set, "add_tool", None)
-        try:
-            if callable(adder):
-                adder(tool)
-            else:
-                tools.append(tool)
-        except Exception as exc:
-            logger.debug("衣柜细节工具挂载失败: %s", _single_line(exc, 160))
-            return False
-        return True
+        return present
 
     # ------------------------------------------------------------------
     # 识图：图片 → 衣物描述

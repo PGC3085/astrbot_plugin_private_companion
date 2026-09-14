@@ -29,6 +29,7 @@ import re
 import json
 import time
 import hashlib
+import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date
 from typing import Any
@@ -913,6 +914,29 @@ WARDROBE_PROMPT_PREAMBLE = (
 )
 
 
+def clean_prompt_limit(value: Any, default: int = WARDROBE_PROMPT_MAX_CHARS) -> int:
+    """把预算折成一个有限整数；非法输入（None / 非数字 / inf / NaN）落回默认值。
+
+    与 :func:`wardrobe_decision.clean_length` 同一思路：预算来自配置或面板，
+    宁可当成默认值，也不能让一次 TypeError/OverflowError 打断整轮注入。
+    注意 `<= 0` 是**不限制**的哨兵语义（见 _truncate_block），这里原样保留。
+    """
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return int(number)
+
+
+def truncate_wardrobe_text(text: str, limit: int) -> str:
+    """把一段**完整段落**（含前言）压到 limit 以内。"""
+
+    return _truncate_block(text, clean_prompt_limit(limit))
+
+
 def _truncate_block(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
@@ -989,7 +1013,8 @@ def _wardrobe_slot_quotas(totals: Mapping[str, int], max_items: Any) -> dict[str
 
     try:
         clean_limit = max(0, int(max_items))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # float('inf') 是 OverflowError，不是 ValueError：JSON 的 Infinity 会走到这里。
         clean_limit = 0
     present = {
         str(slot): int(count)
@@ -1014,7 +1039,9 @@ def _wardrobe_slot_quotas(totals: Mapping[str, int], max_items: Any) -> dict[str
     return quotas
 
 
-def _render_candidate(item: Mapping[str, Any], *, slot_index: int = 0) -> dict[str, Any]:
+def _render_candidate(
+    item: Mapping[str, Any], *, slot_index: int = 0, input_index: int = 0
+) -> dict[str, Any]:
     """把一个衣物条目打成装箱候选：渲染行 + priority + weight。
 
     行文本与长度必须同源：`line` 就是最终写进提示词的那一行，装箱按
@@ -1059,6 +1086,10 @@ def _render_candidate(item: Mapping[str, Any], *, slot_index: int = 0) -> dict[s
         ),
         # weight：最终文本里谁更靠下（数值大者在后）。
         "weight": weight_for_rank(_RENDER_SLOT_RANKS.get(slot, len(_RENDER_SLOT_ORDER))),
+        # 衣柜里的原始次序。作为最后一趟排序的次级键：同 weight（同部位）时按原始顺序
+        # 输出，这样「没有触发丢弃的小衣柜与改造前逐字一致」才真的成立 —— 否则
+        # priority 的先后会泄漏成行序（有描述的排到没描述的前面）。
+        "input_index": input_index,
     }
 
 
@@ -1083,7 +1114,13 @@ def render_wardrobe_block(
     """
 
     clean_tendency = normalize_wardrobe_tendency(tendency)
-    normalized = normalize_wardrobe_items(list(items or ()))
+    # max_items 一路容错，max_chars 也必须容错：两者都是配置/面板来的预算。
+    # （<=0 仍是不限制的哨兵，clean_prompt_limit 保留原值。）
+    max_chars = clean_prompt_limit(max_chars)
+    # str 要原样交给归一化器（它有 json.loads 分支）；先 list() 会把 JSON 文本拆成字符，
+    # 结果是一个空衣柜却不报错。其它可迭代对象才需要先物化。
+    source_items = items if isinstance(items, (str, list, tuple)) else list(items or ())
+    normalized = normalize_wardrobe_items(source_items)
     if not clean_tendency and not normalized:
         return ""
     lines: list[str] = []
@@ -1101,7 +1138,9 @@ def render_wardrobe_block(
         index = slot_cursor.get(slot, 0)
         slot_cursor[slot] = index + 1
         slot_totals[slot] = slot_totals.get(slot, 0) + 1
-        candidates.append(_render_candidate(item, slot_index=index))
+        candidates.append(
+            _render_candidate(item, slot_index=index, input_index=len(candidates))
+        )
     # 部位配额是**硬上限**：先按必要性把条数分给各部位，超出的直接不进装箱。
     # 没有它，偏斜衣柜（例如 20 件配饰 + 2 件上衣）里配饰会吃掉绝大部分名额 ——
     # 轮转只保证每部位都有份，不限制份额。
@@ -1145,7 +1184,9 @@ def render_wardrobe_block(
         packed = _pack(available - len(_wardrobe_notice(len(candidates))) - 1)
         dropped_total = packed["dropped_count"] + quota_dropped
     emitted_slots: set[str] = set()
-    for candidate in packed["kept"]:
+    # 第三趟只保证按 weight 排序；同 weight（同一部位内）必须回到衣柜原始顺序，
+    # 否则 priority 的先后会变成行序。
+    for candidate in sorted(packed["kept"], key=lambda row: (row["weight"], row["input_index"])):
         slot = candidate["slot"]
         if slot not in emitted_slots:
             emitted_slots.add(slot)
@@ -1163,13 +1204,21 @@ def render_wardrobe_prompt(
     max_items: int = WARDROBE_PROMPT_MAX_ITEMS,
     max_chars: int = WARDROBE_PROMPT_MAX_CHARS,
 ) -> str:
-    """Render the wardrobe as a chat-model prompt section body."""
+    """Render the wardrobe as a chat-model prompt section body.
 
+    `max_chars` 约束的是**整段**（前言 + 清单），不是只有清单 —— 调用方与面板都按
+    「这段不超过 N 字」来理解它。
+    """
+
+    limit = clean_prompt_limit(max_chars)
+    budget = limit - len(WARDROBE_PROMPT_PREAMBLE) - 1 if limit > 0 else limit
+    if limit > 0 and budget <= 0:
+        return ""
     block = render_wardrobe_block(
         tendency,
         items,
         max_items=max_items,
-        max_chars=max_chars,
+        max_chars=budget,
     )
     if not block:
         return ""
@@ -1179,6 +1228,8 @@ def render_wardrobe_prompt(
 def render_wardrobe_outfit_prompt(
     tendency: Any,
     selection: Mapping[str, Any] | None,
+    *,
+    max_chars: Any = WARDROBE_PROMPT_MAX_CHARS,
 ) -> str:
     """Render a *resolved* outfit as the prompt-section body.
 
@@ -1201,7 +1252,9 @@ def render_wardrobe_outfit_prompt(
         lines.append(f"整体服饰倾向：{clean_tendency}")
     lines.append("当前着装：")
     lines.append(body)
-    return "\n".join(lines)
+    # 与清单路径同样约束**整段**（这一条原本连 max_chars 参数都没有，
+    # docstring 却自称把注入预算控制在 900 以内）。
+    return _truncate_block("\n".join(lines), clean_prompt_limit(max_chars))
 
 
 # ---------------------------------------------------------------------------
@@ -1884,6 +1937,9 @@ def _render_picked_outfit(picked: Sequence[Mapping[str, Any]]) -> str:
         bucket = [row for row in picked if str(row.get("slot") or "") == slot]
         if not bucket:
             continue
+        # 注意：这里保持「其他」而不是与 _slot_header 的「未分类」统一 ——
+        # 上游测试 test_wardrobe_without_any_slot_still_resolves_an_outfit 钉的就是这个词，
+        # 为一句措辞去改既有测试不划算（已在评审文档里记为 wontfix）。
         label = WARDROBE_SLOT_LABELS.get(slot, "其他")
         for row in bucket:
             marker = "（贴身）" if row.get("intimate") else ""

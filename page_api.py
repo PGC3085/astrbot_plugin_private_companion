@@ -4108,8 +4108,9 @@ class PrivateCompanionPageApi(
         if path is None:
             return self._error("找不到这个素材，或它不是插件目录里的图片")
         try:
-            mime = mimetypes.guess_type(str(path))[0] or "image/png"
-            if mime not in self.WARDROBE_ASSET_IMAGE_MIMES:
+            # 与同文件其它素材接口一致\uff1a未知后缀不能猜成 png\u3002
+            mime = mimetypes.guess_type(str(path))[0] or ""
+            if not mime.startswith("image/") or mime not in self.WARDROBE_ASSET_IMAGE_MIMES:
                 return self._error("这个素材不是可以预览的图片")
             raw = await asyncio.to_thread(path.read_bytes)
             if len(raw) > self.WARDROBE_ASSET_IMAGE_MAX_BYTES:

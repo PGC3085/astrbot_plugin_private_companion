@@ -57,6 +57,12 @@ class _IntentHarness(WardrobeMixin):
     def _schedule_data_save(self, *, sections=(), **_kwargs) -> None:
         self.saved_sections.append(set(sections or ()))
 
+    @staticmethod
+    def _private_user_role(user):
+        """作者侧的角色判定：只有主要用户能改全局状态（daily_state 同款门禁）。"""
+
+        return "owner" if str((user or {}).get("user_id") or "") == "u-owner" else "friend"
+
     def _current_dialogue_outfit_override(self, *, user_id: str = "", now=None):
         snapshot = self.data.get(WARDROBE_INTENT_KEY) or {}
         if not isinstance(snapshot, dict) or not snapshot:
@@ -217,6 +223,30 @@ class WardrobeIntentFallbackTests(unittest.TestCase):
 
 class WardrobeIntentWriteTests(unittest.TestCase):
     """P1：模型工具把意图写进作者那同一个 key，并落盘。"""
+
+    def test_non_owner_cannot_overwrite_the_intent(self) -> None:
+        # 回归：这条 key 是全局的（生图与面板读的是不带用户过滤的那一份）。
+        # 作者那条写路径有 owner 门禁，工具路径原先没有 —— 群里任何一个人
+        # 让模型调一次就能顶掉主人的意图，照片还会按别人的要求穿。
+        plugin = _IntentHarness(items=ITEMS)
+        self.assertTrue(
+            plugin._wardrobe_set_intent("今天穿泳衣", items="i-swim", user=USER)["ok"]
+        )
+        outcome = plugin._wardrobe_set_intent(
+            "我更喜欢外套", items="i-tee", user={"user_id": "u-someone-else"}
+        )
+        self.assertFalse(outcome["ok"], outcome)
+        self.assertTrue(outcome["error"])
+        # 主人的意图原封不动。
+        self.assertEqual(
+            "今天穿泳衣", plugin._wardrobe_dialogue_override(USER).get("instruction")
+        )
+
+    def test_write_is_rejected_when_the_role_check_is_unavailable(self) -> None:
+        plugin = _IntentHarness(items=ITEMS)
+        plugin._private_user_role = None  # type: ignore[assignment]
+        outcome = plugin._wardrobe_set_intent("换上泳衣", items="i-swim", user=USER)
+        self.assertFalse(outcome["ok"], "取不到角色判定时必须 fail-closed")
 
     def test_write_uses_the_authors_key_and_expiry_rules(self) -> None:
         plugin = _IntentHarness(items=ITEMS)

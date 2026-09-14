@@ -73,14 +73,24 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict] = []
 
     def apply_one(asset_id: str) -> dict:
-        draft = load_asset_draft(args.data_dir, asset_id)
-        if not draft:
-            return {"asset_id": asset_id, "ok": False, "error": "还没有草稿（先跑识图）"}
-        store["items"], store["outfits"], outcome = apply_wardrobe_draft(
-            store["items"], store["outfits"], draft, asset_id=asset_id
-        )
-        if outcome.get("ok"):
-            mark_asset_status(args.data_dir, asset_id, ASSET_STATUS_UNDERSTOOD)
+        try:
+            draft = load_asset_draft(args.data_dir, asset_id)
+            if not draft:
+                return {"asset_id": asset_id, "ok": False, "error": "还没有草稿（先跑识图）"}
+            items, outfits, outcome = apply_wardrobe_draft(
+                store["items"], store["outfits"], draft, asset_id=asset_id
+            )
+        except Exception as exc:
+            # 单条失败不该中断整批（与 import_directory 同一约定）。
+            return {"asset_id": asset_id, "ok": False, "error": f"处理失败：{exc}"}
+        if not outcome.get("ok"):
+            return {"asset_id": asset_id, **outcome}
+        # 顺序与运行时一致：**先落库、再推进素材状态**。反过来的话，保存失败时素材
+        # 已经变成 understood，队列里再也看不到它，等于静默丢件（批量中途异常时
+        # 尤其明显：前面几件状态已推进，衣柜却一个字节都没写）。
+        store["items"], store["outfits"] = items, outfits
+        save_wardrobe(wardrobe_path, store)
+        mark_asset_status(args.data_dir, asset_id, ASSET_STATUS_UNDERSTOOD)
         return {"asset_id": asset_id, **outcome}
 
     targets = list(args.apply)
@@ -93,8 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         results.append({"asset_id": asset_id, "ok": bool(record), "kind": "rejected",
                         "error": "" if record else "素材不在索引里"})
 
-    if results:
-        save_wardrobe(wardrobe_path, store)
+    # 衣柜已在每条成功确认时就地保存（见 apply_one），这里不再统一落盘。
 
     if args.json:
         print(json.dumps({"pending": len(pending), "actions": results,

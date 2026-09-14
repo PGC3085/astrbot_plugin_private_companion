@@ -13212,7 +13212,9 @@ class PrivateCompanionPlugin(
         """
         if self is None or self._proactive_only_blocks_passive_event(event, "pc_tools"):
             return '{"status":"disabled","message":"主动消息专用模式下，普通被动回复不可使用 Private Companion 工具。"}'
-        return self._wardrobe_detail_reply(scope=scope, slot=slot)
+        return self._wardrobe_detail_reply(
+            scope=scope, slot=slot, user=self._wardrobe_intent_user(event)
+        )
     @filter.llm_tool(name="pc_set_outfit_intent")
     @_multi_persona_event_context
     async def pc_set_outfit_intent(

@@ -52,8 +52,7 @@ class _WardrobeDetailHarness(WardrobeMixin):
             "wardrobe_injection_detail": "full",
             "wardrobe_outfit_rotation_days": 7,
         }
-        # 宿主里已注册的工具对象；测试用它替代真实注册表。
-        self.detail_tool_stub = SimpleNamespace(name=WARDROBE_DETAIL_TOOL_NAME)
+        # 注：不再需要「取原始工具对象」的替身 —— 同步逻辑只摘不挂。
 
     def persona_setting(self, key: str, default: object = None) -> object:
         return self.config.get(key, default)
@@ -61,8 +60,6 @@ class _WardrobeDetailHarness(WardrobeMixin):
     async def _save_config_if_possible(self) -> bool:
         return True
 
-    def _wardrobe_detail_tool(self):
-        return self.detail_tool_stub
 
 
 def _harness(**kwargs) -> _WardrobeDetailHarness:
@@ -158,7 +155,12 @@ class WardrobeDetailPayloadTests(unittest.TestCase):
 
 
 class WardrobeDetailMountTests(unittest.TestCase):
-    """按请求挂载：衣柜没开就摘掉，开着就确保在表里，且不改变工具通道本身。"""
+    """按请求同步：衣柜没开就摘掉；开着只回答「在不在」，**不往工具表里塞东西**。
+
+    不代挂是刻意的：宿主本来就会按工具自身的 active 状态、人格 tools 白名单与
+    tool_permissions 决定这次请求带哪些工具。自己把原始对象塞回去会复活被管理员
+    停用的工具，并绕过权限代理。
+    """
 
     @staticmethod
     def _request(tools):
@@ -172,16 +174,20 @@ class WardrobeDetailMountTests(unittest.TestCase):
         self.assertFalse(plugin._sync_wardrobe_detail_tool(request))
         self.assertIsNone(request.func_tool)
 
-    def test_available_wardrobe_mounts_the_tool_once(self) -> None:
+    def test_present_tool_is_reported_without_duplicating(self) -> None:
         plugin = _harness()
-        request = self._request([SimpleNamespace(name="other_tool")])
-        self.assertTrue(plugin._sync_wardrobe_detail_tool(request))
-        self.assertEqual(
-            ["other_tool", WARDROBE_DETAIL_TOOL_NAME],
-            [tool.name for tool in request.func_tool.tools],
+        request = self._request(
+            [SimpleNamespace(name="other_tool"), SimpleNamespace(name=WARDROBE_DETAIL_TOOL_NAME)]
         )
         self.assertTrue(plugin._sync_wardrobe_detail_tool(request))
         self.assertEqual(2, len(request.func_tool.tools))
+
+    def test_absent_tool_is_not_force_mounted(self) -> None:
+        # 人格白名单排除、或管理员停用了它：尊重宿主的选择，不代挂。
+        plugin = _harness()
+        request = self._request([SimpleNamespace(name="other_tool")])
+        self.assertFalse(plugin._sync_wardrobe_detail_tool(request))
+        self.assertEqual(["other_tool"], [tool.name for tool in request.func_tool.tools])
 
     def test_disabled_wardrobe_strips_the_tool(self) -> None:
         plugin = _harness(enabled=False)
@@ -191,12 +197,16 @@ class WardrobeDetailMountTests(unittest.TestCase):
         self.assertFalse(plugin._sync_wardrobe_detail_tool(request))
         self.assertEqual(["other_tool"], [tool.name for tool in request.func_tool.tools])
 
-    def test_unregistered_tool_does_not_break_the_request(self) -> None:
+    def test_inactive_tool_is_never_mounted(self) -> None:
+        # 回归：曾经用 get_func() 取原始对象塞回请求，会把 active=False 的工具复活。
         plugin = _harness()
-        plugin.detail_tool_stub = None
         request = self._request([SimpleNamespace(name="other_tool")])
         self.assertFalse(plugin._sync_wardrobe_detail_tool(request))
-        self.assertEqual(1, len(request.func_tool.tools))
+        self.assertEqual(["other_tool"], [tool.name for tool in request.func_tool.tools])
+        self.assertFalse(
+            hasattr(WardrobeMixin, "_wardrobe_detail_tool"),
+            "不该再留取原始对象的入口（那会把停用的工具复活、并绕过权限代理）",
+        )
 
 
 class WardrobeDetailSectionTests(unittest.TestCase):
