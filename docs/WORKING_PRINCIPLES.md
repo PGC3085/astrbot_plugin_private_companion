@@ -116,7 +116,7 @@ PLUGIN_DATA_DIRECTORY_KEY = PLUGIN_ID
 | **关系** | `relationship_ledger.py`、`relationship_policy.py`、`relationship_affinity_runtime.py`、`relationship_event_policy.py`、`companion_interaction_expression.py` | 阶段 / 互动档位 / 关系网 / 表达决策 |
 | **群聊** | `group_observation.py`、`group_wakeup.py`、`group_member_safety.py`、`group_cycle_boundary.py`、`group_prompt_context.py`、`group_context_interception.py` | 观察 / 唤醒 / 续接 / 插话 / 成员安全 |
 | **衣柜** | `wardrobe.py`、`wardrobe_runtime.py`、`wardrobe_assets.py`、`wardrobe_decision.py`、`wardrobe_style.py`、`wardrobe_photo.py` | 散件 / 整套（风格·组合）/ 素材层 / 决策与装箱 / 参考风格画像 / 每日穿搭生图 |
-、`image_companion_bridge.py`、`nai_image_bridge.py`、`photo_reference_*.py`、`photo_wardrobe_decision.py`、`photo_prompt_context.py`、`photo_generation_scope.py` | 视觉理解 / 生图 / 参考图 / 服装意图 |
+| **图片** | `private_image.py`、`image_companion_bridge.py`、`nai_image_bridge.py`、`photo_reference_*.py`、`photo_wardrobe_decision.py`、`photo_prompt_context.py`、`photo_generation_scope.py` | 视觉理解 / 生图 / 参考图 / 服装意图 |
 | **TTS** | `tts_enhancement.py`、`tts_tool_sanitizer.py` | 文本转换 / 链式分段 / Fish Audio / 本机播放 |
 | **梦境 / 日记 / 创作** | `dreaming.py`、`daily_review.py`、`creative.py` | 梦境池 / 日记 / 创作项目生命周期 |
 | **记忆 / 用户 / 世界书** | `user_memory.py`、`worldbook.py`、`memo_notes.py`、`authoritative_private_memory.py`、`memory_page_snapshot.py`、`memory_context_policy.py` | 长期记忆 / 知识库 / 备忘 |
@@ -1393,7 +1393,8 @@ def _can_manage_private_companion(event) -> bool: ...     # main.py L20050 附�
 | 13011 | `pc_query_relation_person` | 13013 | 查询关系人 |
 | 13023 | `pc_get_specified_group_members` | 13025 | 查询指定群成员 |
 | 13176 | `pc_query_wardrobe_detail` | 13178 | 按需查看衣柜细节（今天这身 / 某部位 / 整份清单） |
-| 13195 | `pc_set_outfit_intent` | 13197 | 记录「本会话接下来穿什么」（仅主要用户） |
+| 13196 | `pc_set_outfit_intent` | 13198 | 记录「本会话接下来穿什么」（仅主要用户） |
+| 13036 | `pc_query_interaction` | 13038 | 查询互动状态 |
 | 13053 | `pc_relay_message` | 13055 | 中继消息 |
 | 13075 | `pc_send_to_group` | 13077 | 主动发群 |
 | 13106 | `pc_send_to_private_user` | 13108 | 主动发私聊 |
@@ -2117,11 +2118,11 @@ photo_generation_scope.py                        (~)
 
 # 衣柜
 wardrobe.py                                      2 423
-wardrobe_runtime.py                              2 089
+wardrobe_runtime.py                              2 229
 wardrobe_assets.py                                 584
 wardrobe_decision.py                               347
 wardrobe_style.py                                  180
-wardrobe_photo.py                                  165
+wardrobe_photo.py                                  195
 
 # TTS
 tts_enhancement.py                               5 994

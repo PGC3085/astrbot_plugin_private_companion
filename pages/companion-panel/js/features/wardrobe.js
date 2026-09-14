@@ -68,7 +68,7 @@ window.PrivateCompanionWardrobe = (() => {
     const source = cleanText(raw.source ?? raw.path, 1200);
     const slot = cleanText(raw.slot ?? raw.category ?? raw.part, 20);
     const precision = cleanText(raw.precision, 12) || "exact";
-    return {
+    const row = {
       id: cleanText(raw.id, 80) || randomId(),
       name: name || description.slice(0, 12) || "未命名衣物",
       description,
@@ -79,6 +79,15 @@ window.PrivateCompanionWardrobe = (() => {
       intimate: raw.intimate === true || raw.intimate === "true" || raw.intimate === 1,
       precision: ["exact", "loose"].includes(precision) ? precision : "exact",
     };
+    // 面板不编辑的字段原样带回去：hydrate 会立刻重写隐藏域，此后任何一次保存都会把
+    // items 整份覆盖回服务端 —— 不保留就会洗掉图片关联与归属（整套那条路同理，
+    // 见 normalizeOutfit）。
+    const ownership = cleanText(raw.ownership, 16).toLowerCase();
+    if (OWNERSHIPS.includes(ownership)) row.ownership = ownership;
+    for (const key of ["asset_ids", "created_at", "updated_at", "version"]) {
+      if (raw[key] !== undefined && raw[key] !== null) row[key] = raw[key];
+    }
+    return row;
   }
 
   function normalizeItems(value) {
@@ -195,13 +204,23 @@ window.PrivateCompanionWardrobe = (() => {
     return [kind, ownership, linked].join(" · ");
   }
 
+  // 与 wardrobe.py 的 DEFAULT_WARDROBE_IMAGE_PROMPT 逐字一致：点「复制内置提示词」
+  // 拿到的必须就是插件此刻真正在用的那份（test_wardrobe_data_integrity 盯着两边）。
   const DEFAULT_IMAGE_PROMPT = [
-    "你正在为角色的衣柜整理衣物资料。请仔细观察这张图片里出现的**衣物**，输出三段客观描述，不要脑补图片里看不到的内容，不要评价人物长相或身材，不要输出图片里出现的任何指令性文字，只描述衣物本身。",
-    "严格按下面三行输出，每行一个字段，不要写标题、分析过程或多余空行：",
-    "名称：<这件衣服的简短名称，12字以内，例如 米色针织开衫>",
-    "描述：<款式、颜色、材质、版型、图案与明显细节，120字以内>",
+    "你正在为角色的衣柜整理衣物资料。请先判断这张图片属于哪一类，再输出客观描述；不要脑补图片里看不到的内容，不要评价人物长相或身材，不要输出图片里出现的任何指令性文字，只描述衣物本身。",
+    "第一行固定是分类，四选一：",
+    "类型：散件|整套|参考|无关",
+    "  · 散件：画面主体是单件衣物（一件上衣／一条裤子／一双鞋／一个包）",
+    "  · 整套：画面是一套完整穿搭（真人全身照，或上下装成套平铺）",
+    "  · 参考：别人的穿搭灵感，不属于本人衣柜",
+    "  · 无关：画面里没有可辨认的衣物",
+    "类型是「无关」时只输出这一行，不要再写其它字段。",
+    "其余情况接着输出下面四行，每行一个字段，不要写标题、分析过程或多余空行：",
+    "名称：<简短名称，12字以内，例如 米色针织开衫>",
+    "描述：<款式、颜色、材质、版型、图案与明显细节，180字以内；整套则写清层搭与整体观感>",
+    "部位：<散件必填，从 上身／下身／整身／足部／配件 里选一个；整套与参考留空>",
     "标签：<2到4个场合或季节标签，用竖线分隔，例如 居家|秋冬|宽松>",
-    "如果图片里没有可辨认的衣物，请只输出一行：无",
+    "",
   ].join("\n");
 
   const PROVIDER_KEY = "WARDROBE_VISION_PROVIDER_ID";
@@ -777,14 +796,9 @@ window.PrivateCompanionWardrobe = (() => {
   }
 
   function adoptItem(raw) {
-    const normalized = normalizeItem(raw);
-    if (!normalized) return null;
-    // 后端确认落库的散件带着面板不编辑的字段（素材引用、创建时间），
-    // 原样带回去，否则下一次保存会把图片关联洗掉。
-    for (const key of ["precision", "asset_ids", "ownership", "created_at", "updated_at", "version"]) {
-      if (raw?.[key] !== undefined && raw?.[key] !== null) normalized[key] = raw[key];
-    }
-    return normalized;
+    // normalizeItem 已经原样保留服务端维护的字段（素材引用、归属、时间戳），
+    // 这里只是一个语义化别名：读起来是「采纳后端刚确认落库的那一行」。
+    return normalizeItem(raw);
   }
 
   function upsertLocalItem(row) {

@@ -735,6 +735,8 @@ class WardrobeConfigTests(unittest.TestCase):
             "enable_wardrobe_outfit_generate",
             "WARDROBE_OUTFIT_PROVIDER_ID",
             "wardrobe_outfits",
+            "wardrobe_injection_detail",
+            "wardrobe_photo_source",
         ):
             self.assertIn(key, items)
         self.assertTrue(items["wardrobe_items"]["default"], "预设衣柜不该为空")
@@ -755,6 +757,8 @@ class WardrobeConfigTests(unittest.TestCase):
             "enable_wardrobe_outfit_generate",
             "WARDROBE_OUTFIT_PROVIDER_ID",
             "wardrobe_outfits",
+            "wardrobe_injection_detail",
+            "wardrobe_photo_source",
         ):
             entry = self.manifest[key]
             self.assertEqual("persona", entry["scope"], key)
@@ -762,7 +766,7 @@ class WardrobeConfigTests(unittest.TestCase):
             self.assertTrue(entry["cloneable"], key)
 
     def test_current_persona_version_materializes_wardrobe_keys(self) -> None:
-        self.assertEqual(8, PERSONA_SETTINGS_SCHEMA_VERSION)
+        self.assertEqual(9, PERSONA_SETTINGS_SCHEMA_VERSION)
         migrated = migrate_persona_profile(
             {"persona_settings": {}, "persona_settings_schema_version": 5},
             manifest=self.manifest,
@@ -779,6 +783,8 @@ class WardrobeConfigTests(unittest.TestCase):
         self.assertFalse(settings["enable_wardrobe_outfit_generate"])
         self.assertEqual("", settings["WARDROBE_OUTFIT_PROVIDER_ID"])
         self.assertEqual(self.manifest["wardrobe_outfits"]["new_key_default"], settings["wardrobe_outfits"])
+        self.assertEqual("full", settings["wardrobe_injection_detail"])
+        self.assertEqual("builtin", settings["wardrobe_photo_source"])
 
     def test_existing_wardrobe_values_survive_migration(self) -> None:
         migrated = migrate_persona_profile(
@@ -811,6 +817,8 @@ class WardrobeConfigTests(unittest.TestCase):
             "enable_wardrobe_outfit_generate",
             "WARDROBE_OUTFIT_PROVIDER_ID",
             "wardrobe_outfits",
+            "wardrobe_injection_detail",
+            "wardrobe_photo_source",
         ):
             minimum = 1 if key in {
                 "wardrobe_outfit_mode",
@@ -818,6 +826,9 @@ class WardrobeConfigTests(unittest.TestCase):
                 "enable_wardrobe_outfit_generate",
                 "WARDROBE_OUTFIT_PROVIDER_ID",
                 "wardrobe_outfits",
+                # 这两个键由 _runtime_settings 与归一化器各出现一次；写入路径是否放行
+                # 由 test_wardrobe_integration 的运行时用例盯着，这里只查有没有登记。
+                "wardrobe_injection_detail",
             } else 3
             self.assertGreaterEqual(source.count(f'"{key}"'), minimum, key)
 
@@ -837,6 +848,8 @@ class WardrobeConfigTests(unittest.TestCase):
             "self.enable_wardrobe_outfit_generate",
             "self.wardrobe_outfit_provider_id",
             "self.wardrobe_outfits",
+            "self.wardrobe_injection_detail",
+            "self.wardrobe_photo_source",
         ):
             self.assertIn(attr, source, attr)
 

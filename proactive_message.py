@@ -11548,23 +11548,33 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         history = self._daily_outfit_rotation_history()
         if not history:
             return ""
-        labels = {
-            "palette": "color palettes",
-            "outer": "outer layers",
-            "silhouette": "silhouettes",
-        }
-        fragments: list[str] = []
-        for field, label in labels.items():
-            values: list[str] = []
-            for item in history:
-                profile = self._normalize_daily_outfit_profile(item.get("outfit_profile"))
-                value = _single_line(profile.get(field), 56)
-                if value and value not in values:
-                    values.append(value)
-                if len(values) >= 2:
-                    break
-            if values:
-                fragments.append(f"{label}: {' / '.join(values)}")
+
+        def collect(fields: dict[str, str]) -> list[str]:
+            fragments: list[str] = []
+            for field, label in fields.items():
+                values: list[str] = []
+                for item in history:
+                    profile = self._normalize_daily_outfit_profile(item.get("outfit_profile"))
+                    value = _single_line(profile.get(field), 56)
+                    if value and value not in values:
+                        values.append(value)
+                    if len(values) >= 2:
+                        break
+                if values:
+                    fragments.append(f"{label}: {' / '.join(values)}")
+            return fragments
+
+        fragments = collect(
+            {
+                "palette": "color palettes",
+                "outer": "outer layers",
+                "silhouette": "silhouettes",
+            }
+        )
+        if not fragments:
+            # 衣柜接管的投影只有 top/outer/bottom/footwear（没有 palette/silhouette），
+            # 不退一步的话这句 "avoid repeating" 约束会整段从照片提示词里消失。
+            fragments = collect({"top": "tops", "bottom": "bottoms", "footwear": "footwear"})
         return _single_line("; ".join(fragments), 280)
 
     def _format_weather_for_prompt(self) -> str:

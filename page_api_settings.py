@@ -561,7 +561,8 @@ class PageSettingNormalizerMixin:
             raw_source = str(value or "").strip().casefold()
             return "wardrobe" if raw_source in {"wardrobe", "衣柜", "跟随衣柜"} else "builtin"
         if key == "wardrobe_outfit_mode":
-            return "select" if str(value or "").strip().casefold() == "select" else "inventory"
+            # 兜底与 schema / bootstrap 的默认值对齐（都应该是 select）。
+            return "inventory" if str(value or "").strip().casefold() == "inventory" else "select"
         if key == "wardrobe_injection_detail":
             return (
                 "progressive"

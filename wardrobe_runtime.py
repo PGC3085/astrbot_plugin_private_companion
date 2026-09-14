@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
@@ -66,6 +67,7 @@ from .wardrobe import (
     normalize_wardrobe_slot,
     normalize_wardrobe_tendency,
     outfit_photo_profile,
+    outfit_photo_profile_from_items,
     parse_wardrobe_image_reply,
     parse_wardrobe_outfit_reply,
     render_generated_outfit,
@@ -109,8 +111,24 @@ WARDROBE_MINIMAL_MAX_CHARS = 200
 # 所以触发权收在关键词与命令上（架构 §风险：触发权）。
 _WARDROBE_DETAIL_TRIGGERS = (
     "衣服", "穿着", "穿搭", "着装", "外套", "上衣", "衬衫", "毛衣", "卫衣", "开衫",
-    "裤子", "裙", "连衣裙", "鞋", "靴", "袜", "围巾", "帽子", "眼镜", "配饰", "包",
-    "打扮", "换装", "换衣", "衣柜", "好看吗", "穿什么", "今天穿", "outfit", "wear",
+    "裤子", "裙", "连衣裙", "鞋", "靴", "袜", "围巾", "帽子", "眼镜", "配饰",
+    "背包", "包包", "手提包", "挎包", "书包", "单肩包",
+    "打扮", "换装", "换衣", "衣柜", "穿什么", "今天穿", "outfit", "wear",
+)
+
+# 单字触发词必须带边界：「包」在面包/红包/打包/邮包 里都不是衣服。
+# 用负向后顾把它收紧成「前面不像别的词」的裸包，这样「我的包好看吗」仍然命中，
+# 而「我想吃面包」「给你发个红包」「帮我打包文件」不再命中。
+_WARDROBE_DETAIL_TRIGGER_PATTERNS = (
+    re.compile(r"(?<![面红打邮书钱沙纸背钱])(?<![出行背书])包"),
+)
+
+# `好看吗` 单独出现太泛（电影/菜/天气都能这么问），必须与穿着语境同现才算问到衣服。
+_WARDROBE_DETAIL_CONTEXT_TRIGGERS = (
+    "好看吗", "好看不", "怎么样",
+)
+_WARDROBE_DETAIL_CONTEXT_WORDS = (
+    "穿", "衣服", "衣", "裙", "裤", "鞋", "袜", "外套", "搭", "打扮", "造型",
 )
 
 # 区分“没有这个值”和“值是 None”，回滚时据此决定是否写回。
@@ -148,6 +166,8 @@ _WARDROBE_DRAFT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".
 # 名字一旦改了，llm_tool_actions.py 的 known_names 也要跟着改 —— 那张表决定
 # 「模型把工具调用当纯文本吐出来」时能不能被识别并从可见回复里剥掉。
 WARDROBE_DETAIL_TOOL_NAME = "pc_query_wardrobe_detail"
+# 写工具的名字也收在这里：摘除时要读写一起摘，否则同一个开关下两个工具行为不一致。
+WARDROBE_INTENT_TOOL_NAME = "pc_set_outfit_intent"
 
 # 本会话明确换装（作者的 dialogue_outfit_override）最多带上几件。
 # 上限只是为了把段落长度钉死在 WARDROBE_PROMPT_MAX_CHARS 以内。
@@ -166,6 +186,11 @@ WARDROBE_INTENT_SOURCE_MODEL = "model_tool"
 # 但仍有硬上限，避免 40 件长描述把一次工具结果撑成几千字。
 WARDROBE_DETAIL_MAX_ITEMS = 40
 WARDROBE_DETAIL_MAX_CHARS = 2400
+# 只读工具的 scope 取值（含模型常用的中文说法）。不在表里就明确回一句「不认识」，
+# 而不是默默按 today 回答 —— 后者会让模型以为自己问的那一份拿到了。
+WARDROBE_DETAIL_SCOPES = frozenset(
+    {"today", "今天", "今日", "slot", "部位", "all", "全部", "所有", "清单", "inventory"}
+)
 
 # 注入段落里那句「可以调用工具」的提示。只在工具真的挂上了这次请求时才拼进去，
 # 否则等于让模型调用一个不存在的工具（不支持 function calling 的模型尤其明显）。
@@ -293,12 +318,23 @@ class WardrobeMixin:
 
     @staticmethod
     def _wardrobe_detail_triggered(text: Any) -> bool:
-        """True when the inbound message is actually about what she is wearing."""
+        """True when the inbound message is actually about what she is wearing.
+
+        三重判定：多字触发词裸匹配；单字「包」走带边界的正则；「好看吗/怎么样」这类
+        泛化问法必须与穿着语境同现（否则「这电影好看吗」会把 ≤900 字整份清单塞进一轮
+        无关对话）。
+        """
 
         haystack = _single_line(text, 400).casefold()
         if not haystack:
             return False
-        return any(word.casefold() in haystack for word in _WARDROBE_DETAIL_TRIGGERS)
+        if any(word.casefold() in haystack for word in _WARDROBE_DETAIL_TRIGGERS):
+            return True
+        if any(pattern.search(haystack) for pattern in _WARDROBE_DETAIL_TRIGGER_PATTERNS):
+            return True
+        if any(word in haystack for word in _WARDROBE_DETAIL_CONTEXT_TRIGGERS):
+            return any(word in haystack for word in _WARDROBE_DETAIL_CONTEXT_WORDS)
+        return False
 
     def _wardrobe_minimal_body(self, user: Any = None, tendency: Any = "") -> str:
         """常驻最小集：只够让模型知道"今天穿什么"，细节留给触发时展开。"""
@@ -307,7 +343,8 @@ class WardrobeMixin:
         parts: list[str] = []
         if self._wardrobe_outfit_mode() == "select":
             try:
-                selection = self._wardrobe_outfit_selection(user)
+                # 与 select 段落、只读工具同源：意图 > 生成器 > 规则。
+                selection = self._wardrobe_resolved_outfit(user)
             except Exception:
                 selection = {}
             name = _single_line((selection or {}).get("outfit_name"), 24)
@@ -338,8 +375,9 @@ class WardrobeMixin:
     def _wardrobe_outfit_mode(self) -> str:
         """Return inventory (列出全部衣物) or select (只注入裁决出的那一套)."""
 
-        text = _single_line(self._wardrobe_setting("wardrobe_outfit_mode", "inventory"), 20).casefold()
-        return "select" if text == "select" else "inventory"
+        # 兜底与 schema / plugin_bootstrap 的默认值一致（都是 select）。
+        text = _single_line(self._wardrobe_setting("wardrobe_outfit_mode", "select"), 20).casefold()
+        return "inventory" if text == "inventory" else "select"
 
     def _wardrobe_outfit_rotation_days(self) -> int:
         """Cooldown window, kept in the same 1..30 range as the author's photo setting."""
@@ -701,7 +739,9 @@ class WardrobeMixin:
             key = str(row.get("name") or "").strip().casefold()
             if key:
                 by_name.setdefault(key, []).append(row)
-        outfit_rows = self._wardrobe_outfits()
+        # 整套同样只用**自有**的：参考整套是别人的穿搭灵感，被点名成
+        # 「她换成了这套」会污染作者的连续性段落与日程调整（与散件路径同规格）。
+        outfit_rows = self._wardrobe_owned_outfits()
         outfits_by_id = {str(row.get("id") or ""): row for row in outfit_rows}
         outfits_by_name: dict[str, dict[str, Any]] = {}
         for row in outfit_rows:
@@ -776,6 +816,11 @@ class WardrobeMixin:
         data = getattr(self, "data", None)
         if not isinstance(data, dict):
             outcome["error"] = "当前运行时不支持记录穿衣意图。"
+            return outcome
+        # 总开关关掉时读写两个工具必须一致：读工具已被按请求摘掉，写工具若不拦，
+        # 管理员关掉衣柜后模型仍能改角色着装（还会写进作者的连续性段落）。
+        if not self._wardrobe_enabled():
+            outcome["error"] = "角色衣柜没有启用。"
             return outcome
         # 门禁：作者那条写同一个 key 的路径只认主要用户（daily_state 里
         # `_private_user_role(user) != "owner"` 直接返回）。这条 key 是全局的
@@ -905,12 +950,14 @@ class WardrobeMixin:
         body = self._wardrobe_override_body(
             self._wardrobe_dialogue_override(user), tendency
         )
+        # 注意这里是**嵌套 if 不是 elif 链**：最小集可能因为「衣柜里全是参考件」返回空串，
+        # 用 elif 会被短路成 return None —— 整段衣柜（连参考风格画像）静默消失。
         if not body and progressive and not self._wardrobe_detail_triggered(text):
             # 常驻最小集：每轮都发，但很短；细节等触发。
             body = self._wardrobe_minimal_body(user, tendency)
-        elif not body and self._wardrobe_outfit_mode() == "select":
+        if not body and self._wardrobe_outfit_mode() == "select":
             body = self._wardrobe_selected_outfit_body(user, tendency)
-        elif not body:
+        if not body:
             body = render_wardrobe_prompt(
                 tendency,
                 items,
@@ -935,6 +982,44 @@ class WardrobeMixin:
             content=body,
         )
 
+    def _wardrobe_resolved_outfit(self, user: Any = None) -> dict[str, Any]:
+        """「今天这一身」的**唯一**解析入口：本会话意图 > 生成器缓存 > 规则裁决。
+
+        段落（select 模式）、渐进披露最小集、只读工具的 today、面板预览都必须走这里。
+        否则同一天会出现多套答案 —— 实测：生成器开启时提示词按缓存写「奶油色针织开衫」，
+        模型照段落里那句提示去调工具，拿回的是规则裁决的「白衬衫黑纱裙」。
+
+        返回值与 :func:`select_wardrobe_outfit` 同形，另外在 override 时多一个
+        ``instruction``（意图原文），供最小集与工具复用。
+        """
+
+        override = self._wardrobe_dialogue_override(user)
+        if override:
+            items = self._wardrobe_override_items(override)
+            return {
+                "source": "dialogue_override",
+                "scene": self._wardrobe_current_scene(),
+                "style": "",
+                "prompt_text": render_worn_items(items),
+                "profile": outfit_photo_profile_from_items(items),
+                "picked": [
+                    {
+                        "id": str(item.get("id") or ""),
+                        "name": str(item.get("name") or ""),
+                        "slot": str(item.get("slot") or ""),
+                        "intimate": bool(item.get("intimate")),
+                    }
+                    for item in items
+                ],
+                "look_id": "",
+                "outfit_name": "",
+                "instruction": _single_line(override.get("instruction"), 180),
+            }
+        generated = self._wardrobe_cached_generated_outfit()
+        if generated is not None:
+            return self._wardrobe_generated_selection(generated, self._wardrobe_current_scene())
+        return self._wardrobe_outfit_selection(user)
+
     def _wardrobe_selected_outfit_body(self, user: Any = None, tendency: Any = "") -> str:
         """Body for the select mode: only the resolved outfit, not the inventory.
 
@@ -943,12 +1028,13 @@ class WardrobeMixin:
         silently becomes empty.
         """
 
-        generated = self._wardrobe_cached_generated_outfit()
-        if generated is not None:
-            selection = self._wardrobe_generated_selection(generated, self._wardrobe_current_scene())
-        else:
-            selection = self._wardrobe_outfit_selection(user)
-            # 同步路径不能等模型：这里只排一个后台任务，下一轮就能用上生成结果。
+        selection = self._wardrobe_resolved_outfit(user)
+        if selection.get("source") == "dialogue_override":
+            # 意图段落由 _wardrobe_override_body 负责（它要带 instruction 行，且不能出现
+            # 「当前着装：」标题）；走到这里说明调用方绕过了那条路，交回清单更安全。
+            return ""
+        if selection.get("source") == "rule":
+            # 同步路径不能等模型：只有落到规则裁决时才排后台生成，下一轮就能用上结果。
             self._schedule_wardrobe_outfit_generation(user)
         body = render_wardrobe_outfit_prompt(tendency, selection)
         if body:
@@ -1193,15 +1279,29 @@ class WardrobeMixin:
             self._wardrobe_generated_selection(generated, clean_scene)
             if generated is not None else selection
         )
+        # 预览必须与真实注入同源：意图 > 生成器 > 规则，并且要认渐进披露。
+        # 预览没有「本轮消息」，渐进披露按「未触发」算 —— 也就是那个常驻最小集。
+        # 面板没有用户身份，意图读的是不带过滤的那一份（与 /wardrobe/intent 一致）。
+        override = self._wardrobe_override_snapshot()
+        effective_source = ""
         injected = ""
         if self._wardrobe_enabled() and self._wardrobe_prompt_mode():
-            if mode == "select":
+            if override:
+                injected = self._wardrobe_override_body(override, tendency)
+                effective_source = "dialogue_override"
+            elif self._wardrobe_injection_detail() == WARDROBE_DETAIL_PROGRESSIVE:
+                injected = self._wardrobe_minimal_body(None, tendency)
+                effective_source = "minimal"
+            else:
+                effective_source = "generated" if generated is not None else "rule"
+            if not injected and mode == "select":
                 injected = render_wardrobe_outfit_prompt(tendency, selected)
             if not injected:
                 injected = render_wardrobe_prompt(
                     tendency, items, max_items=self._wardrobe_prompt_item_limit(),
                     max_chars=WARDROBE_PROMPT_MAX_CHARS,
                 )
+                effective_source = effective_source or "inventory"
         key = self._wardrobe_outfit_cache_key()
         cache = getattr(self, "_wardrobe_outfit_cache_store", {})
         tasks = getattr(self, "_wardrobe_generation_tasks", {})
@@ -1251,6 +1351,9 @@ class WardrobeMixin:
             "injected": injected,
             "injected_chars": len(injected),
             "injected_limit": WARDROBE_PROMPT_MAX_CHARS,
+            # 这次注入实际由哪条路径决定（意图 / 生成器 / 规则 / 最小集 / 清单），
+            # 让面板能解释「为什么注入的是这一份」。
+            "effective_source": effective_source,
             # 渐进披露对比：面板可以直接把"常驻最小集"与完整注入并排显示
             "detail_mode": self._wardrobe_injection_detail(),
             "minimal": self._wardrobe_minimal_body(None, tendency),
@@ -1358,6 +1461,12 @@ class WardrobeMixin:
             payload["status"] = "unavailable"
             payload["text"] = "角色衣柜当前没有启用，或衣柜里还没有衣物。"
             return payload
+        if clean_scope not in WARDROBE_DETAIL_SCOPES:
+            payload["status"] = "unknown_scope"
+            payload["text"] = (
+                "scope 只支持 today（今天这身）/ slot（指定部位）/ all（整份衣柜）。"
+            )
+            return payload
         items = self._wardrobe_items()
         if clean_scope in {"slot", "部位"}:
             if not clean_slot:
@@ -1366,7 +1475,13 @@ class WardrobeMixin:
                     "请给出部位：upper 上装 / lower 下装 / whole 整身 / feet 鞋 / extra 配件。"
                 )
                 return payload
-            rows = [item for item in items if str(item.get("slot") or "") == clean_slot]
+            # 只列**自有**散件：参考件是别人的穿搭灵感，列进「某部位都有什么」
+            # 会让模型以为她拥有并可穿（与 scope=all 的口径保持一致）。
+            rows = [
+                item
+                for item in self._wardrobe_owned_items()
+                if str(item.get("slot") or "") == clean_slot
+            ]
             label = WARDROBE_SLOT_LABELS.get(clean_slot, clean_slot)
             payload["count"] = len(rows)
             if not rows:
@@ -1383,30 +1498,47 @@ class WardrobeMixin:
             lines, truncated = self._wardrobe_detail_lines(
                 owned, limit_items=WARDROBE_DETAIL_MAX_ITEMS, limit_chars=WARDROBE_DETAIL_MAX_CHARS
             )
-            parts = [f"衣柜共 {len(items)} 件散件 / {len(self._wardrobe_outfits())} 套整套。"]
+            # 表头、正文、count 三者必须同一口径（都是自有件）：此前表头按全部计数、
+            # 正文只列自有件，模型会照表头声称她拥有参考件。
+            parts = [
+                f"衣柜共 {len(owned)} 件可穿散件 / {len(self._wardrobe_owned_outfits())} 套整套。"
+            ]
             tendency = self._wardrobe_tendency()
             if tendency:
                 parts.append(f"整体服饰倾向：{tendency}")
             if lines:
                 parts.append("可穿散件：\n" + "\n".join(lines))
             outfits = self._wardrobe_owned_outfits()
-            if outfits:
-                names = [str(row.get("name") or "") for row in outfits if str(row.get("name") or "")]
-                if names:
-                    parts.append("整套：" + "、".join(names))
+            names = [str(row.get("name") or "") for row in outfits if str(row.get("name") or "")]
+            # 整套名单此前不参与预算，30 套长名字实测能把回包撑到 3184 字 ——
+            # 逐条累加，超预算就停下并标 truncated。
+            if names:
+                budget = WARDROBE_DETAIL_MAX_CHARS - sum(len(part) + 1 for part in parts)
+                kept: list[str] = []
+                for name in names:
+                    if len("、".join((*kept, name))) + 3 > budget:
+                        truncated = True
+                        break
+                    kept.append(name)
+                if kept:
+                    suffix = "…" if len(kept) < len(names) else ""
+                    parts.append("整套：" + "、".join(kept) + suffix)
             profile_line = self._wardrobe_reference_profile_line()
-            if profile_line:
+            if profile_line and len(profile_line) + 1 <= WARDROBE_DETAIL_MAX_CHARS - sum(len(p) + 1 for p in parts):
                 parts.append(profile_line)
             payload["count"] = len(owned)
             payload["text"] = "\n".join(parts)
             payload["truncated"] = truncated
             return payload
-        # 与提示词**同源**：本会话明确换装优先。否则工具会报「轮换裁决那一套」，
-        # 而同一轮提示词写着「当前着装以这次换装为准」—— 模型按提示来问一次，
-        # 反而被带回相反的答案（P0 刚消掉的两段冲突会从工具路径复现）。
-        override = self._wardrobe_dialogue_override(user)
-        if override:
-            override_items = self._wardrobe_override_items(override)
+        # 与提示词**同源**：走同一个解析入口（意图 > 生成器 > 规则）。
+        # 只补 override 分支是不够的 —— 生成器开启时提示词按缓存渲染，工具却报规则裁决，
+        # 模型照段落提示来问一次就被带回另一套衣服。
+        selection = self._wardrobe_resolved_outfit(user)
+        if selection.get("source") == "dialogue_override":
+            override_items = self._wardrobe_override_items(
+                self._wardrobe_dialogue_override(user)
+            )
+            override = {"instruction": selection.get("instruction")}
             override_parts: list[str] = []
             instruction = _single_line(override.get("instruction"), 180)
             if instruction:
@@ -1428,7 +1560,8 @@ class WardrobeMixin:
             payload["truncated"] = override_truncated
             payload["source"] = "dialogue_override"
             return payload
-        selection = self._wardrobe_outfit_selection(user)
+        # 注意：**不要**在这里重新调 _wardrobe_outfit_selection —— 那会把上面解析出的
+        # 生成器结果覆盖掉，正是「提示词按缓存渲染、工具报规则裁决」的根因。
         picked_ids = {str(row.get("id") or "") for row in (selection.get("picked") or ())}
         picked = [item for item in items if str(item.get("id") or "") in picked_ids]
         parts = []
@@ -1447,11 +1580,16 @@ class WardrobeMixin:
         lines, truncated = self._wardrobe_detail_lines(
             picked, limit_items=WARDROBE_DETAIL_MAX_ITEMS, limit_chars=WARDROBE_DETAIL_MAX_CHARS
         )
+        prompt_text = str(selection.get("prompt_text") or "").strip()
         if lines:
             parts.append("今天这身：\n" + "\n".join(lines))
+        elif prompt_text:
+            # 生成器路径：模型给的是整套描述，没有逐件 id 映射，直接原文给出。
+            parts.append("今天这身（模型搭配）：\n" + prompt_text)
         else:
             parts.append("今天还没有裁决出具体的一套，可以参考整份清单再决定。")
         payload["count"] = len(picked)
+        payload["source"] = str(selection.get("source") or "")
         payload["text"] = "\n".join(parts)
         payload["truncated"] = truncated
         return payload
@@ -1492,10 +1630,12 @@ class WardrobeMixin:
             getattr(tool, "name", "") == WARDROBE_DETAIL_TOOL_NAME for tool in tools
         )
         if not self._wardrobe_detail_available():
-            if present:
+            # 读写两个工具一起摘：只摘读工具会让写工具留下来，同一个开关下行为不一致。
+            wardrobe_tools = {WARDROBE_DETAIL_TOOL_NAME, WARDROBE_INTENT_TOOL_NAME}
+            if any(getattr(tool, "name", "") in wardrobe_tools for tool in tools):
                 tools[:] = [
                     tool for tool in tools
-                    if getattr(tool, "name", "") != WARDROBE_DETAIL_TOOL_NAME
+                    if getattr(tool, "name", "") not in wardrobe_tools
                 ]
             return False
         return present

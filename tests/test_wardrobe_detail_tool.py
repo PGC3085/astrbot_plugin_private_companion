@@ -132,7 +132,7 @@ class WardrobeDetailPayloadTests(unittest.TestCase):
 
     def test_all_scope_lists_the_whole_wardrobe(self) -> None:
         payload = _harness()._wardrobe_detail_payload("all")
-        self.assertIn("衣柜共 4 件散件", payload["text"])
+        self.assertIn("衣柜共 4 件可穿散件", payload["text"])
         self.assertIn("细框眼镜", payload["text"])
         self.assertIn("偏爱宽松针织", payload["text"])
 

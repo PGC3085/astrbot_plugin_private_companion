@@ -61,6 +61,15 @@ def _call(host: Any, name: str, default: Any = None) -> Any:
 def wardrobe_photo_source(host: Any) -> str:
     """Return wardrobe (接管) or builtin (沿用作者候选表)."""
 
+    # 衣柜整个关掉时不存在「接管」这回事：面板会把这一项藏起来，但配置里可能留着
+    # 上次的值，两边一起看才自洽。
+    enabled = getattr(host, "_wardrobe_enabled", None)
+    if callable(enabled):
+        try:
+            if not enabled():
+                return WARDROBE_PHOTO_SOURCE_BUILTIN
+        except Exception:
+            pass
     getter = getattr(host, "_wardrobe_setting", None)
     raw = ""
     if callable(getter):
@@ -132,27 +141,44 @@ def resolve_daily_outfit_profile(host: Any, *, date_key: str = "") -> dict[str, 
     try:
         if wardrobe_photo_source(host) != WARDROBE_PHOTO_SOURCE_WARDROBE:
             return {}
-        # 本会话已明确换装 > 当天轮换裁决：照片要跟对话里已经发生的事一致。
-        intent_profile = _dialogue_intent_profile(host)
-        if intent_profile:
-            return _decorate(host, intent_profile)
-        items = _call(host, "_wardrobe_owned_items", []) or []
-        outfits = _call(host, "_wardrobe_owned_outfits", []) or []
-        if not items and not outfits:
-            return {}
-        scene = _text(_call(host, "_wardrobe_current_scene", ""), 32)
-        seed = _text(date_key, 60) or _text(_call(host, "_wardrobe_outfit_seed", ""), 60)
-        rotation = _call(host, "_wardrobe_outfit_rotation_days", 7)
-        try:
-            rotation_days = int(rotation)
-        except (TypeError, ValueError):
-            rotation_days = 7
-        selection = select_wardrobe_outfit(
-            items, outfits, scene=scene, seed=seed, rotation_days=rotation_days
-        )
+        # 「今天穿什么」只认宿主上的唯一解析入口：本会话意图 > 生成器缓存 > 规则裁决。
+        # 此前这里自己按 date_key 重新裁决，等于绕开那个入口 —— 种子少了人格分量
+        # （同一天提示词说一套、照片穿另一套），也看不到生成器结果（开了模型生成着装
+        # 之后照片仍然只认规则轮换）。
+        resolver = getattr(host, "_wardrobe_resolved_outfit", None)
+        if callable(resolver):
+            selection = resolver()
+            profile = selection.get("profile") if isinstance(selection, Mapping) else None
+            if not isinstance(profile, Mapping) or not profile:
+                return {}
+            return _decorate(host, profile, look_id=selection.get("look_id"))
+        return _rule_daily_outfit_profile(host, date_key=date_key)
     except Exception:
         return {}
 
+
+def _rule_daily_outfit_profile(host: Any, *, date_key: str = "") -> dict[str, str]:
+    """回退路径：宿主没有统一解析入口时（旧版本或测试替身）自己按规则裁决。"""
+
+    # 本会话已明确换装 > 当天轮换裁决：照片要跟对话里已经发生的事一致。
+    intent_profile = _dialogue_intent_profile(host)
+    if intent_profile:
+        return _decorate(host, intent_profile)
+    items = _call(host, "_wardrobe_owned_items", []) or []
+    outfits = _call(host, "_wardrobe_owned_outfits", []) or []
+    if not items and not outfits:
+        return {}
+    scene = _text(_call(host, "_wardrobe_current_scene", ""), 32)
+    # 优先用宿主自己的种子（带人格分量）：它才是对话侧用的那一把。
+    seed = _text(_call(host, "_wardrobe_outfit_seed", ""), 60) or _text(date_key, 60)
+    rotation = _call(host, "_wardrobe_outfit_rotation_days", 7)
+    try:
+        rotation_days = int(rotation)
+    except (TypeError, ValueError):
+        rotation_days = 7
+    selection = select_wardrobe_outfit(
+        items, outfits, scene=scene, seed=seed, rotation_days=rotation_days
+    )
     profile = selection.get("profile") if isinstance(selection, Mapping) else None
     if not isinstance(profile, Mapping) or not profile:
         return {}

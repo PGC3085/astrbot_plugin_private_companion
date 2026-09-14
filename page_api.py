@@ -4112,7 +4112,16 @@ class PrivateCompanionPageApi(
             mime = mimetypes.guess_type(str(path))[0] or ""
             if not mime.startswith("image/") or mime not in self.WARDROBE_ASSET_IMAGE_MIMES:
                 return self._error("这个素材不是可以预览的图片")
+            # 先 stat 再读：导入期有上限，但手工放进目录、手改 index 的文件不受约束，
+            # 整份读进内存再拒绝会白白分配这份内存（与同文件其它素材接口一致）。
+            try:
+                size = int((await asyncio.to_thread(path.stat)).st_size)
+            except OSError:
+                return self._error("这个素材已经读不到了")
+            if size > self.WARDROBE_ASSET_IMAGE_MAX_BYTES:
+                return self._error("素材图片过大，无法在面板里预览")
             raw = await asyncio.to_thread(path.read_bytes)
+            # 读完再比一次：文件可能在 stat 与 read 之间被换掉。
             if len(raw) > self.WARDROBE_ASSET_IMAGE_MAX_BYTES:
                 return self._error("素材图片过大，无法在面板里预览")
             return self._ok(
@@ -26771,6 +26780,8 @@ class PrivateCompanionPageApi(
             "wardrobe_image_prompt",
             "WARDROBE_VISION_PROVIDER_ID",
             "wardrobe_items",
+            "wardrobe_outfits",
+            "WARDROBE_OUTFIT_PROVIDER_ID",
             "wardrobe_photo_source",
             "enable_user_requested_photo_generation",
             "allow_generate_photo_on_reaction_turns",
