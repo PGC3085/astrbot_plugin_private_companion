@@ -273,6 +273,7 @@ __all__ = [
     "build_wardrobe_outfit_request",
     "parse_wardrobe_outfit_reply",
     "render_generated_outfit",
+    "render_worn_items",
     "outfit_photo_profile",
 ]
 
@@ -1889,6 +1890,17 @@ def _render_picked_outfit(picked: Sequence[Mapping[str, Any]]) -> str:
             text = f"{row.get('name')}{marker}"
             lines.append(f"{label}：{text}——{detail}" if detail else f"{label}：{text}")
     return "\n".join(lines)
+
+
+def render_worn_items(picked: Sequence[Mapping[str, Any]] | None) -> str:
+    """Render the items a character is *explicitly* wearing right now.
+
+    与 :func:`select_wardrobe_outfit` 的规则裁决结果共用同一个渲染格式
+    （:func:`_render_picked_outfit`），避免「今天这一身」与「本会话指定穿这一身」
+    两处措辞各自漂移。
+    """
+
+    return _render_picked_outfit(list(picked or ()))
 
 
 def select_wardrobe_outfit(

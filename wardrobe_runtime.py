@@ -43,6 +43,7 @@ from .wardrobe import (
     WARDROBE_MAX_TAG,
     WARDROBE_PROMPT_MAX_CHARS,
     WARDROBE_PROMPT_MAX_ITEMS,
+    WARDROBE_PROMPT_PREAMBLE,
     WARDROBE_SLOT_LABELS,
     WardrobeError,
     WardrobeLimitError,
@@ -68,6 +69,7 @@ from .wardrobe import (
     render_generated_outfit,
     render_wardrobe_outfit_prompt,
     render_wardrobe_prompt,
+    render_worn_items,
     select_wardrobe_outfit,
     update_wardrobe_item,
     update_wardrobe_outfit,
@@ -143,6 +145,10 @@ _WARDROBE_DRAFT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".
 # 名字一旦改了，llm_tool_actions.py 的 known_names 也要跟着改 —— 那张表决定
 # 「模型把工具调用当纯文本吐出来」时能不能被识别并从可见回复里剥掉。
 WARDROBE_DETAIL_TOOL_NAME = "pc_query_wardrobe_detail"
+
+# 本会话明确换装（作者的 dialogue_outfit_override）最多带上几件。
+# 上限只是为了把段落长度钉死在 WARDROBE_PROMPT_MAX_CHARS 以内。
+WARDROBE_OVERRIDE_MAX_ITEMS = 12
 
 # 工具回包的上限：它是「按需展开」，不是把整份衣柜倒给模型，所以比注入段落宽松、
 # 但仍有硬上限，避免 40 件长描述把一次工具结果撑成几千字。
@@ -506,6 +512,96 @@ class WardrobeMixin:
     # 提示词
     # ------------------------------------------------------------------
 
+    def _wardrobe_dialogue_override(self, user: Any = None) -> dict[str, Any]:
+        """作者那套「最近一次明确换装」（本会话意图）；取不到就返回 {}。
+
+        只认有身份的私聊用户：作者的连续性段落本身也只在私聊注入，群聊里带上某个人的
+        换装会把别人的衣服穿到群里。
+        """
+
+        user_id = (
+            _single_line((user or {}).get("user_id"), 80)
+            if isinstance(user, Mapping)
+            else ""
+        )
+        if not user_id:
+            return {}
+        getter = getattr(self, "_current_dialogue_outfit_override", None)
+        if not callable(getter):
+            return {}
+        try:
+            snapshot = getter(user_id=user_id)
+        except TypeError:
+            # 宿主签名可能只接受位置参数；退化成不带身份读取。
+            try:
+                snapshot = getter()
+            except Exception:
+                return {}
+        except Exception:
+            return {}
+        return dict(snapshot) if isinstance(snapshot, Mapping) else {}
+
+    def _wardrobe_override_items(self, snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """把意图解析成衣柜里的实物：整套优先，其次是散件 id 列表。"""
+
+        items = self._wardrobe_items()
+        by_id = {str(item.get("id") or ""): item for item in items}
+        picked: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def take(raw: Any) -> None:
+            key = str(raw or "")
+            item = by_id.get(key)
+            if item is None or key in seen:
+                return
+            seen.add(key)
+            picked.append(item)
+
+        outfit_id = _single_line(snapshot.get("wardrobe_outfit_id"), 80)
+        if outfit_id:
+            for outfit in self._wardrobe_outfits():
+                if str(outfit.get("id") or "") != outfit_id:
+                    continue
+                for item_id in outfit.get("items") or ():
+                    take(item_id)
+                break
+        if not picked:
+            raw_items = snapshot.get("wardrobe_items")
+            if isinstance(raw_items, (list, tuple)):
+                for raw in raw_items:
+                    take(raw)
+        return picked[:WARDROBE_OVERRIDE_MAX_ITEMS]
+
+    def _wardrobe_override_body(
+        self, snapshot: Mapping[str, Any], tendency: Any = ""
+    ) -> str:
+        """本会话明确换装时的段落正文。
+
+        与另外两条渲染路径共用同一段前言（措辞只有一处），但**刻意不出现「当前着装：」**
+        这个标题 —— 那个标题的含义是「这是我们裁决出来的那一套」，而这里的一身是用户或
+        剧情指定的。
+        """
+
+        instruction = _single_line(snapshot.get("instruction"), 180)
+        items = self._wardrobe_override_items(snapshot)
+        if not instruction and not items:
+            return ""
+        lines = [WARDROBE_PROMPT_PREAMBLE]
+        clean_tendency = normalize_wardrobe_tendency(tendency)
+        if clean_tendency:
+            lines.append(f"整体服饰倾向：{clean_tendency}")
+        lines.append("本会话已经明确换装，当前着装以这次换装为准：")
+        if instruction:
+            lines.append(f"最近一次明确换装：{instruction}")
+        if items:
+            lines.append(render_worn_items(items))
+        else:
+            lines.append(
+                "衣柜清单里没有完全对应的衣物：按剧情临时服装处理，"
+                "不要用清单里的默认搭配把它换回来，也不要声称它出自衣柜。"
+            )
+        return chr(10).join(lines)
+
     def _wardrobe_prompt_section(
         self, user: Any = None, text: Any = "", *, detail_tool: bool = False
     ) -> PromptSection | None:
@@ -525,12 +621,19 @@ class WardrobeMixin:
         if not tendency and not items and not outfits:
             return None
         progressive = self._wardrobe_injection_detail() == WARDROBE_DETAIL_PROGRESSIVE
-        if progressive and not self._wardrobe_detail_triggered(text):
+        # 本会话已经明确换装时整段以它为准：绝不能再把轮换裁决出的那一套标成
+        # 「当前着装」，否则同一轮提示词里会出现两段互相矛盾的说法 —— 作者的
+        # 连续性段落说「最近一次明确换装：泳衣…不得自行恢复旧服装」，我们这边
+        # 却写着「当前着装：短裤」。
+        body = self._wardrobe_override_body(
+            self._wardrobe_dialogue_override(user), tendency
+        )
+        if not body and progressive and not self._wardrobe_detail_triggered(text):
             # 常驻最小集：每轮都发，但很短；细节等触发。
             body = self._wardrobe_minimal_body(user, tendency)
-        elif self._wardrobe_outfit_mode() == "select":
+        elif not body and self._wardrobe_outfit_mode() == "select":
             body = self._wardrobe_selected_outfit_body(user, tendency)
-        else:
+        elif not body:
             body = render_wardrobe_prompt(
                 tendency,
                 items,
