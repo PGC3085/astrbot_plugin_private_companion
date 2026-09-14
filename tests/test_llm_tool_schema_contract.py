@@ -18,6 +18,7 @@ EXPECTED_TOOL_AUTHORING_HASHES = {
     "pc_manage_schedule": "5d2fedded654e99be3f1959df9071dc87c5e08b1fe0f4f0bb4c228bffdbdbc71",
     "pc_query_interaction": "bef2bcb33ebb98ca0ac86c196267fadc006f5e1c798b9a475b42dec2ec6157aa",
     "pc_query_relation_person": "ebd19c1a071da8cc3efb3a7022d2c9cdefac9144fe9b95d9e6de0c205b2e344c",
+    "pc_query_wardrobe_detail": "30d4dfa8da79fa3af2bde26cbd1543ac162a3d6d775237f9d7d2609c65d5cb9d",
     "pc_qzone_publish_feed": "de25cc569fa2ba778066738920320387f4e5d08e3e176b642fe312dbe6bd8987",
     "pc_qzone_reply_my_comment": "ffba39788f1c7cad41b9d4b4c62d035c9ce73775ed08e0e782b5683240779682",
     "pc_qzone_view_feed": "d8a022d25585064e61764ac8ddcb23560e6e621c81e4980eab68eaf46ae1cb9d",

@@ -13196,6 +13196,23 @@ class PrivateCompanionPlugin(
             return '{"status":"disabled","message":"主动消息专用模式下，普通被动回复不可使用 Private Companion 工具。"}'
         return await self._pc_get_specified_group_members_impl(event, **kwargs)
 
+    @filter.llm_tool(name="pc_query_wardrobe_detail")
+    @_multi_persona_event_context
+    async def pc_query_wardrobe_detail(
+        self, event: AstrMessageEvent, scope: str = "today", slot: str = ""
+    ) -> str:
+        """查看角色衣柜的更多细节：某个部位都有什么、今天这身每件是什么、整份衣柜清单。
+
+        只在用户或剧情需要具体衣物时调用一次即可；衣柜为空或未启用时工具会直接说明，
+        不要据此编造衣物。
+
+        Args:
+            scope(string): today=今天裁决出的这一身穿了什么（默认）；slot=指定部位的全部衣物；all=整份衣柜清单。
+            slot(string): 仅 scope=slot 时需要。部位：upper 上装 / lower 下装 / whole 整身（连衣裙）/ feet 鞋 / extra 配件，也认「上装」「裙子」这类中文说法。
+        """
+        if self is None or self._proactive_only_blocks_passive_event(event, "pc_tools"):
+            return '{"status":"disabled","message":"主动消息专用模式下，普通被动回复不可使用 Private Companion 工具。"}'
+        return self._wardrobe_detail_reply(scope=scope, slot=slot)
     @filter.llm_tool(name="pc_query_interaction")
     @_multi_persona_event_context
     async def pc_query_interaction(self, event: AstrMessageEvent, **kwargs) -> str:

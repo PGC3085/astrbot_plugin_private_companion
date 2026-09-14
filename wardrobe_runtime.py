@@ -60,6 +60,7 @@ from .wardrobe import (
     normalize_wardrobe_image_prompt,
     normalize_wardrobe_items,
     normalize_wardrobe_outfits,
+    normalize_wardrobe_slot,
     normalize_wardrobe_tendency,
     outfit_photo_profile,
     parse_wardrobe_image_reply,
@@ -137,6 +138,23 @@ WARDROBE_ASSET_ORIGIN_LABELS: dict[str, str] = {
 
 # 缩略图只对位图有意义；视频帧与分享文本在队列里只显示一行字。
 _WARDROBE_DRAFT_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+
+# 按需索取细节的只读工具（在 main.py 用 @filter.llm_tool 注册，这里负责数据与挂载）。
+# 名字一旦改了，llm_tool_actions.py 的 known_names 也要跟着改 —— 那张表决定
+# 「模型把工具调用当纯文本吐出来」时能不能被识别并从可见回复里剥掉。
+WARDROBE_DETAIL_TOOL_NAME = "pc_query_wardrobe_detail"
+
+# 工具回包的上限：它是「按需展开」，不是把整份衣柜倒给模型，所以比注入段落宽松、
+# 但仍有硬上限，避免 40 件长描述把一次工具结果撑成几千字。
+WARDROBE_DETAIL_MAX_ITEMS = 40
+WARDROBE_DETAIL_MAX_CHARS = 2400
+
+# 注入段落里那句「可以调用工具」的提示。只在工具真的挂上了这次请求时才拼进去，
+# 否则等于让模型调用一个不存在的工具（不支持 function calling 的模型尤其明显）。
+WARDROBE_DETAIL_TOOL_HINT = (
+    "需要更多细节时可以调用 pc_query_wardrobe_detail（某部位都有什么、今天这身每件是什么）；"
+    "不要凭空编造衣柜里没有的衣物。"
+)
 
 
 class WardrobeMixin:
@@ -488,10 +506,15 @@ class WardrobeMixin:
     # 提示词
     # ------------------------------------------------------------------
 
-    def _wardrobe_prompt_section(self, user: Any = None, text: Any = "") -> PromptSection | None:
+    def _wardrobe_prompt_section(
+        self, user: Any = None, text: Any = "", *, detail_tool: bool = False
+    ) -> PromptSection | None:
         """Build the wardrobe prompt section, or ``None`` when it should not inject.
 
         text 是本轮用户消息：渐进披露模式下用它判断"要不要展开完整描述"。
+
+        detail_tool 为真时在段落末尾追加一句「可以调用 pc_query_wardrobe_detail」——
+        由调用方先挂好工具再传进来，避免提示词里写了一件这次请求根本没有的工具。
         """
 
         if not self._wardrobe_enabled() or not self._wardrobe_prompt_mode():
@@ -521,6 +544,10 @@ class WardrobeMixin:
         profile_line = self._wardrobe_reference_profile_line()
         if profile_line and len(body) + len(profile_line) + 1 <= WARDROBE_PROMPT_MAX_CHARS:
             body = f"{body}\n{profile_line}"
+        # 工具提示排最后：放不下就牺牲它（工具本身还在，只是模型不知道，
+        # 退化成现在这套「关键词触发展开」的行为）。
+        if detail_tool and len(body) + len(WARDROBE_DETAIL_TOOL_HINT) + 1 <= WARDROBE_PROMPT_MAX_CHARS:
+            body = f"{body}\n{WARDROBE_DETAIL_TOOL_HINT}"
         return prompt_section(
             key=WARDROBE_PROMPT_KEY,
             title="角色衣柜",
@@ -855,11 +882,20 @@ class WardrobeMixin:
 
         if req is None:
             return
+        # 先把只读工具按请求挂好，再决定提示词里要不要写它 —— 顺序不能反，
+        # 否则会出现「提示词说有、工具表里没有」。
+        syncer = getattr(self, "_sync_wardrobe_detail_tool", None)
+        detail_tool = False
+        if callable(syncer):
+            try:
+                detail_tool = bool(syncer(req))
+            except Exception as exc:
+                logger.debug("群聊衣柜细节工具挂载失败: %s", _single_line(exc, 160))
         builder = getattr(self, "_wardrobe_prompt_section", None)
         if not callable(builder):
             return
         try:
-            section = builder(None)
+            section = builder(None, detail_tool=detail_tool)
         except Exception as exc:
             logger.debug("群聊角色衣柜提示词构建失败: %s", _single_line(exc, 160))
             return
@@ -873,6 +909,214 @@ class WardrobeMixin:
             placer(req, marker, section, priority=13)
         except Exception as exc:
             logger.debug("群聊角色衣柜注入失败: %s", _single_line(exc, 160))
+
+    # ------------------------------------------------------------------
+    # 按需索取：只读工具
+    # ------------------------------------------------------------------
+
+    def _wardrobe_detail_available(self) -> bool:
+        """这次请求查得到东西吗：衣柜启用、注入开启、且衣柜非空。"""
+
+        if not self._wardrobe_enabled() or not self._wardrobe_prompt_mode():
+            return False
+        return bool(self._wardrobe_items() or self._wardrobe_outfits())
+
+    @staticmethod
+    def _wardrobe_detail_lines(
+        items: Any, *, limit_items: int, limit_chars: int
+    ) -> tuple[list[str], bool]:
+        """把条目渲染成「序号. [部位] 名称（标签）：描述」，条数与字数双重封顶。"""
+
+        lines: list[str] = []
+        used = 0
+        truncated = False
+        for index, item in enumerate(items or (), start=1):
+            if limit_items and len(lines) >= limit_items:
+                truncated = True
+                break
+            detail = _single_line(item.get("description"), WARDROBE_MAX_DESCRIPTION)
+            tags = [str(tag) for tag in (item.get("tags") or []) if str(tag).strip()]
+            if item.get("intimate"):
+                tags = ["贴身", *tags]
+            slot = str(item.get("slot") or "")
+            slot_label = WARDROBE_SLOT_LABELS.get(slot, "未分类")
+            suffix = f"（{'/'.join(tags)}）" if tags else ""
+            line = f"{index}. [{slot_label}] {item.get('name') or ''}{suffix}"
+            if detail:
+                line = f"{line}：{detail}"
+            if limit_chars and used + len(line) + 1 > limit_chars:
+                truncated = True
+                break
+            used += len(line) + 1
+            lines.append(line)
+        return lines, truncated
+
+    def _wardrobe_detail_payload(
+        self, scope: Any = "today", slot: Any = "", user: Any = None
+    ) -> dict[str, Any]:
+        """只读地组装「模型按需索取」的衣柜细节。
+
+        三种 scope：
+
+        * today —— 今天裁决出的那一套（逐件名称与描述）；
+        * slot  —— 指定部位的全部衣物（需要 slot 参数）；
+        * all   —— 整份衣柜清单（散件 + 整套 + 参考风格画像）。
+
+        全程只读：不写配置、不调模型、不推进任何状态，重复调用结果一致。
+        """
+
+        clean_scope = _single_line(scope, 16).casefold() or "today"
+        clean_slot = normalize_wardrobe_slot(_single_line(slot, 24))
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "scope": clean_scope,
+            "slot": clean_slot,
+            "text": "",
+            "truncated": False,
+        }
+        if not self._wardrobe_detail_available():
+            payload["status"] = "unavailable"
+            payload["text"] = "角色衣柜当前没有启用，或衣柜里还没有衣物。"
+            return payload
+        items = self._wardrobe_items()
+        if clean_scope in {"slot", "部位"}:
+            if not clean_slot:
+                payload["status"] = "need_slot"
+                payload["text"] = (
+                    "请给出部位：upper 上装 / lower 下装 / whole 整身 / feet 鞋 / extra 配件。"
+                )
+                return payload
+            rows = [item for item in items if str(item.get("slot") or "") == clean_slot]
+            label = WARDROBE_SLOT_LABELS.get(clean_slot, clean_slot)
+            payload["count"] = len(rows)
+            if not rows:
+                payload["text"] = f"{label}：还没有衣物。"
+                return payload
+            lines, truncated = self._wardrobe_detail_lines(
+                rows, limit_items=WARDROBE_DETAIL_MAX_ITEMS, limit_chars=WARDROBE_DETAIL_MAX_CHARS
+            )
+            payload["text"] = f"{label}（共 {len(rows)} 件）：\n" + "\n".join(lines)
+            payload["truncated"] = truncated
+            return payload
+        if clean_scope in {"all", "全部", "清单", "inventory"}:
+            owned = self._wardrobe_owned_items()
+            lines, truncated = self._wardrobe_detail_lines(
+                owned, limit_items=WARDROBE_DETAIL_MAX_ITEMS, limit_chars=WARDROBE_DETAIL_MAX_CHARS
+            )
+            parts = [f"衣柜共 {len(items)} 件散件 / {len(self._wardrobe_outfits())} 套整套。"]
+            tendency = self._wardrobe_tendency()
+            if tendency:
+                parts.append(f"整体服饰倾向：{tendency}")
+            if lines:
+                parts.append("可穿散件：\n" + "\n".join(lines))
+            outfits = self._wardrobe_owned_outfits()
+            if outfits:
+                names = [str(row.get("name") or "") for row in outfits if str(row.get("name") or "")]
+                if names:
+                    parts.append("整套：" + "、".join(names))
+            profile_line = self._wardrobe_reference_profile_line()
+            if profile_line:
+                parts.append(profile_line)
+            payload["count"] = len(owned)
+            payload["text"] = "\n".join(parts)
+            payload["truncated"] = truncated
+            return payload
+        selection = self._wardrobe_outfit_selection(user)
+        picked_ids = {str(row.get("id") or "") for row in (selection.get("picked") or ())}
+        picked = [item for item in items if str(item.get("id") or "") in picked_ids]
+        parts = []
+        scene = _single_line(self._wardrobe_current_scene(), 40)
+        if scene:
+            parts.append(f"今天的场合：{scene}")
+        tendency = self._wardrobe_tendency()
+        if tendency:
+            parts.append(f"整体服饰倾向：{tendency}")
+        style = _single_line(selection.get("style"), 200)
+        if style:
+            parts.append(f"这一身的风格：{style}")
+        outfit_name = _single_line(selection.get("outfit_name"), WARDROBE_MAX_NAME)
+        if outfit_name:
+            parts.append(f"整套：{outfit_name}")
+        lines, truncated = self._wardrobe_detail_lines(
+            picked, limit_items=WARDROBE_DETAIL_MAX_ITEMS, limit_chars=WARDROBE_DETAIL_MAX_CHARS
+        )
+        if lines:
+            parts.append("今天这身：\n" + "\n".join(lines))
+        else:
+            parts.append("今天还没有裁决出具体的一套，可以参考整份清单再决定。")
+        payload["count"] = len(picked)
+        payload["text"] = "\n".join(parts)
+        payload["truncated"] = truncated
+        return payload
+
+    def _wardrobe_detail_reply(self, scope: Any = "today", slot: Any = "", user: Any = None) -> str:
+        """工具的返回值：JSON 字符串（宿主会以 role:"tool" 回灌给模型）。"""
+
+        try:
+            payload = self._wardrobe_detail_payload(scope, slot, user)
+        except Exception as exc:
+            # 工具绝不能把异常抛回宿主的工具循环：宁可回一句「读不到」，
+            # 也不要让整轮对话因为衣柜而失败。
+            logger.warning("衣柜细节工具执行失败: %s", _single_line(exc, 160))
+            return json.dumps({"status": "error", "text": "读取衣柜细节失败。"}, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _wardrobe_detail_tool(self) -> Any:
+        """取宿主里已注册的那个工具对象（注册在 main.py 的 @filter.llm_tool）。"""
+
+        try:
+            from astrbot.core.provider.register import llm_tools
+        except Exception:
+            return None
+        try:
+            return llm_tools.get_func(WARDROBE_DETAIL_TOOL_NAME)
+        except Exception:
+            return None
+
+    def _sync_wardrobe_detail_tool(self, req: Any) -> bool:
+        """按请求挂载/摘下衣柜细节工具，返回「这次请求模型能不能调用它」。
+
+        * 衣柜没启用（或注入关闭）→ 从这次请求的工具表里摘掉：模型不该看到一个
+          查不出任何东西的工具；
+        * 衣柜可用 → 确保它在工具表里。前提是**这次请求本来就开着工具通道**
+          （req.func_tool 是有 tools 列表的 ToolSet）。为 None 说明本次没有启用
+          function calling（例如模型不支持），这时不新建工具表去改变宿主行为。
+
+        已知取舍：如果用户在人格里配了 tools 白名单刻意排除本工具，这里仍会把它补
+        回去 —— 因为同一轮我们已经在提示词里写了这件工具（WARDROBE_DETAIL_TOOL_HINT），
+        提示词与工具表必须一致，否则模型会照着提示词凭空「调用」一个不存在的工具。
+        """
+
+        tool_set = getattr(req, "func_tool", None)
+        tools = getattr(tool_set, "tools", None)
+        if not isinstance(tools, list):
+            return False
+        present = any(
+            getattr(tool, "name", "") == WARDROBE_DETAIL_TOOL_NAME for tool in tools
+        )
+        if not self._wardrobe_detail_available():
+            if present:
+                tools[:] = [
+                    tool for tool in tools
+                    if getattr(tool, "name", "") != WARDROBE_DETAIL_TOOL_NAME
+                ]
+            return False
+        if present:
+            return True
+        tool = self._wardrobe_detail_tool()
+        if tool is None:
+            logger.debug("衣柜细节工具没有注册，跳过挂载")
+            return False
+        adder = getattr(tool_set, "add_tool", None)
+        try:
+            if callable(adder):
+                adder(tool)
+            else:
+                tools.append(tool)
+        except Exception as exc:
+            logger.debug("衣柜细节工具挂载失败: %s", _single_line(exc, 160))
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # 识图：图片 → 衣物描述
