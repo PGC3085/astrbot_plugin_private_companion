@@ -538,11 +538,26 @@ class FinalResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pc_history_media", internal_text)
         written = await harness._archive_proactive_message_to_conversation(
             user={"umo": UMO},
-            user_prompt="【主动承接占位】",
+            user_prompt=harness._build_proactive_archive_user_prompt(
+                reason="scheduled",
+                action="photo_text",
+                action_summary="发图",
+            ),
             assistant_response=internal_text,
         )
 
         self.assertTrue(written)
+        self.assertEqual(
+            "",
+            harness._build_proactive_archive_user_prompt(
+                reason="scheduled",
+                action="message",
+            ),
+        )
+        self.assertEqual(
+            ["user", "assistant"],
+            [item["role"] for item in harness.conversation_manager.history],
+        )
         archived = harness.conversation_manager.history[-1]["content"]
         self.assertIn("主动发送的图片说明", archived)
         self.assertNotIn("pc_history_media", archived)
@@ -617,7 +632,7 @@ class FinalResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
             harness.conversation_manager.history[-1]["content"],
         )
 
-    async def test_proactive_placeholder_stays_out_of_livingmemory(self):
+    async def test_proactive_assistant_only_archive_stays_out_of_livingmemory(self):
         captured: list[str] = []
 
         async def livingmemory_handler(_event, response):
@@ -644,7 +659,7 @@ class FinalResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         ):
             await harness._archive_proactive_message_to_conversation(
                 user={"umo": UMO},
-                user_prompt="【主动承接占位】",
+                user_prompt="",
                 assistant_response="实际发出的主动消息",
             )
             await harness._record_final_assistant_in_livingmemory(
