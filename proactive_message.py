@@ -18587,9 +18587,6 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         motive: str = "",
         action_summary: str = "",
     ) -> str:
-        # AstrBot history is stored as user/assistant pairs. Keep the synthetic
-        # user side empty so an implementation detail can never appear in the
-        # conversation UI or be echoed by a later model response.
         return ""
 
     @staticmethod
@@ -18779,10 +18776,12 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             return False
         for attempt in range(4):
             try:
-                archive_context_only = self._proactive_archive_context_text(user_prompt)
                 safe_user_prompt = str(user_prompt or "").strip()
-                user_msg_obj = UserMessageSegment(content=safe_user_prompt)
+                archive_context_only = not safe_user_prompt or self._proactive_archive_context_text(
+                    safe_user_prompt
+                )
                 assistant_msg_obj = AssistantMessageSegment(content=visible_assistant_response)
+
                 async def _write():
                     conv_id = await self._ensure_conversation_id_for_umo(umo, title="Private Companion 主动消息")
                     if not conv_id:
@@ -18804,7 +18803,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                     else:
                         await conversation_manager.add_message_pair(
                             cid=conv_id,
-                            user_message=user_msg_obj,
+                            user_message=UserMessageSegment(content=safe_user_prompt),
                             assistant_message=assistant_msg_obj,
                         )
                     return True
