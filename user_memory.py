@@ -289,6 +289,29 @@ _PLATFORM_DISPLAY_NAMES = {
     "discord": "Discord",
 }
 
+# 深夜时间锚点：11 点/23 点单独出现只是一个时间事实（行程、用药、约见等），
+# 只有与睡意线索出现在同一小句里，才算「现在很晚了」的宣言。时间短语整体匹配
+# （连半/一刻一起吃掉），并排除「点左右/前后」这类区间说法，避免只删掉半截。
+_LATE_CLOCK = (
+    r"(?:(?:十一|11|23)\s*[点點](?:\s*(?:半|一刻|三刻|\d{1,2}))?"
+    r"(?![点點]?\s*(?:左右|前后|以后|以前|多|来))"
+    r"|23\s*[:：]\s*\d{1,2})"
+)
+_LATE_CLOCK_INTRO = r"(?:快|差不多|都|已经|马上|就要)"
+_SLEEP_CUE = (
+    r"(?:困不困|困了|该睡|该休息|早点睡|去睡|睡觉|睡吧|睡了|晚安|熬夜|夜深|深夜|歇息|休息|别熬|快睡)"
+)
+# 隐含深夜说法（「时间不早了」「都这么晚了」）。
+_IMPLICIT_LATE = (
+    r"(?:(?:时间|时候|天色).{0,4}(?:不早|(?:这么|很|太)晚)|"
+    r"(?:都|已经|这会儿|现在).{0,4}(?:不早|(?:这么|很|太)晚)|"
+    r"(?:不早|(?:这么|很|太)晚).{0,3}(?:了|啦|咯))"
+)
+# 钟点与睡意线索之间的允许间隔：不跨句号（不跨句），可以跨问号/感叹号。
+_LATE_CLAIM_GAP = r"[^。\n]{0,6}"
+# 删除起点：句首或小句边界，避免从句子中间把话切走。
+_CLAUSE_BOUNDARY = r"(?:^|(?<=[。！？!?；;\n])|[。！？!?；;])"
+
 class UserMemoryMixin:
     """用户记忆系统"""
 
@@ -9201,23 +9224,16 @@ Character-specific bottom-line baseline (reference only; empty means use the con
             return False
         now = self._environment_now()
         current_minutes = now.hour * 60 + now.minute
+        # 钟点必须与睡意线索同句才算深夜宣言；白天的 11 点只是普通时间点。
+        late_clock = r"(?:" + _LATE_CLOCK_INTRO + r"\s*)?(?:晚上)?" + _LATE_CLOCK
         explicit_late_anchor = bool(
-            re.search(r"(快|差不多|都|已经)?\s*(?:晚上)?(?:十一|11|23)\s*[点點]|23\s*[:：]\s*\d{1,2}", cleaned)
+            re.search(late_clock + _LATE_CLAIM_GAP + _SLEEP_CUE, cleaned)
+            or re.search(_SLEEP_CUE + _LATE_CLAIM_GAP + late_clock, cleaned)
         )
-        implicit_late_anchor = bool(
-            re.search(
-                r"(?:时间|时候|天色).{0,4}(?:不早|(?:这么|很|太)晚)|"
-                r"(?:都|已经|这会儿|现在).{0,4}(?:不早|(?:这么|很|太)晚)|"
-                r"(?:不早|(?:这么|很|太)晚).{0,3}(?:了|啦|咯)",
-                cleaned,
-            )
-        )
-        sleep_anchor = bool(re.search(r"(困不困|该睡|睡觉|睡了|晚安|熬夜|夜深|深夜)", cleaned))
+        implicit_late_anchor = bool(re.search(_IMPLICIT_LATE, cleaned))
         late_night = 22 * 60 <= current_minutes or current_minutes <= 90
         if (explicit_late_anchor or implicit_late_anchor) and not late_night:
             return True
-        if sleep_anchor and re.search(r"(快|差不多|都|已经).{0,8}(?:十一|11|23)\s*[点點]", cleaned):
-            return not late_night
         return False
 
     def _has_open_proactive_awaiting_reply(self, user: dict[str, Any]) -> bool:
@@ -9279,15 +9295,25 @@ Character-specific bottom-line baseline (reference only; empty means use the con
             return "啊，刚才那句时间感说偏了，是我没接稳你前一句。"
         if "false_no_reply_claim" in active_flags and self._compact_repeat_text(inbound_text) in {"", "？", "?", "啥", "什么", "shenme"}:
             return "啊，我刚才那句是顺口接你问的“有意思的什么”，不是说你没回。"
+        # 只删完整的深夜宣言（可带泛称称呼、可带睡意线索），删到该小句结束；
+        # 白天的普通时间点不匹配，也不会被截成半截，更不会从句中切走。
         cleaned = re.sub(
-            r"[，,。！？!?；;、\s]*(?:(?:[\u4e00-\u9fffA-Za-z0-9_\-]{1,12})[，,、:：]|(?:主人|宝贝|亲爱的|宝宝|老师))?\s*(?:快|差不多|都|已经)?\s*(?:晚上)?(?:十一|11|23)\s*[点點][了啦]?[，,、\s]*(?:困不困|该睡了?|睡觉吧?|晚安)?[？?。！!~～]*",
+            _CLAUSE_BOUNDARY + r"[，,；;、\s]*"
+            r"(?:(?:[\u4e00-\u9fffA-Za-z0-9_\-]{1,12})[，,、:：]|(?:主人|宝贝|亲爱的|宝宝|老师))?\s*"
+            + _LATE_CLOCK_INTRO + r"?\s*(?:晚上)?" + _LATE_CLOCK + r"(?:了|啦|咯|吧)?"
+            + _LATE_CLAIM_GAP + _SLEEP_CUE + r"[^，,。！？!?\n]{0,8}[，,。！？!?]?[？?。！!~～]*",
             "",
             cleaned,
         ).strip()
+        # 「时间不早了」这类隐含深夜说法：后面跟着睡意线索时连小句一起删，
+        # 否则只删宣言本身，不牵连后面那句话。
         cleaned = re.sub(
-            r"[，,。！？!?；;、\s]*(?:那[^，,。！？!?；;]{0,12})?"
-            r"(?:(?:时间|时候|天色).{0,4}(?:不早|(?:这么|很|太)晚)|(?:都|已经|这会儿|现在).{0,4}(?:不早|(?:这么|很|太)晚)|(?:不早|(?:这么|很|太)晚).{0,3}(?:了|啦|咯))"
-            r"[^。！？!?\n]{0,20}(?:歇息|休息|睡觉|睡|晚安)?[^。！？!?\n]{0,6}[？?。！!~～]*",
+            _CLAUSE_BOUNDARY + r"[，,；;、\s]*(?:那[^，,。！？!?；;]{0,12})?" + _IMPLICIT_LATE + r"(?:了|啦|咯)?"
+            r"(?:"
+            + _LATE_CLAIM_GAP + _SLEEP_CUE + r"[^，,。！？!?\n]{0,8}[，,。！？!?]?"
+            r"|(?=[，,。！？!?]|$)[，,。！？!?]?"
+            r")"
+            r"[？?。！!~～]*",
             "",
             cleaned,
         ).strip()
