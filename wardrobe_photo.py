@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .wardrobe import select_wardrobe_outfit
+from .wardrobe import outfit_photo_profile_from_items, select_wardrobe_outfit
 
 WARDROBE_PHOTO_SOURCE_WARDROBE = "wardrobe"
 WARDROBE_PHOTO_SOURCE_BUILTIN = "builtin"
@@ -71,12 +71,67 @@ def wardrobe_photo_source(host: Any) -> str:
     return WARDROBE_PHOTO_SOURCE_BUILTIN if raw.strip().casefold() == WARDROBE_PHOTO_SOURCE_BUILTIN else WARDROBE_PHOTO_SOURCE_WARDROBE
 
 
+def _dialogue_intent_profile(host: Any) -> dict[str, str]:
+    """本会话已明确换装时的照片投影；没有就返回 {}。
+
+    用户说「今天穿泳衣」，照片就该是泳衣 —— 这里读的是作者那套
+    dialogue_outfit_override（不带用户过滤：照片是角色当天穿什么，不是某个人的视角）。
+    解析不到实物（衣柜里没有这件）时返回 {}，交回轮换结果，避免照片凭空多出衣服。
+    """
+
+    getter = getattr(host, "_current_dialogue_outfit_override", None)
+    if not callable(getter):
+        return {}
+    try:
+        snapshot = getter(user_id="")
+    except Exception:
+        return {}
+    if not isinstance(snapshot, Mapping) or not snapshot:
+        return {}
+    resolver = getattr(host, "_wardrobe_override_items", None)
+    if not callable(resolver):
+        return {}
+    try:
+        items = resolver(snapshot)
+    except Exception:
+        return {}
+    if not items:
+        return {}
+    return outfit_photo_profile_from_items(items)
+
+
+def _decorate(host: Any, profile: Mapping[str, Any], *, look_id: Any = "") -> dict[str, str]:
+    """按 PHOTO_PROFILE_FIELDS 收口，再补上 look_id / 场景 / 天气。"""
+
+    result: dict[str, str] = {}
+    for key in PHOTO_PROFILE_FIELDS:
+        value = _text(profile.get(key), PHOTO_PROFILE_LIMITS[key])
+        if value:
+            result[key] = value
+    if not result:
+        return {}
+    clean_look_id = _text(look_id, 80)
+    if clean_look_id:
+        result["look_id"] = clean_look_id
+    scene = _text(_call(host, "_wardrobe_current_scene", ""), 32)
+    if scene:
+        result["scene"] = scene
+    weather = _text(_call(host, "_wardrobe_current_weather", ""), 32)
+    if weather:
+        result["weather"] = weather
+    return result
+
+
 def resolve_daily_outfit_profile(host: Any, *, date_key: str = "") -> dict[str, str]:
     """Today's photo outfit profile from the wardrobe; {} means "let the author decide"."""
 
     try:
         if wardrobe_photo_source(host) != WARDROBE_PHOTO_SOURCE_WARDROBE:
             return {}
+        # 本会话已明确换装 > 当天轮换裁决：照片要跟对话里已经发生的事一致。
+        intent_profile = _dialogue_intent_profile(host)
+        if intent_profile:
+            return _decorate(host, intent_profile)
         items = _call(host, "_wardrobe_owned_items", []) or []
         outfits = _call(host, "_wardrobe_owned_outfits", []) or []
         if not items and not outfits:
@@ -97,21 +152,7 @@ def resolve_daily_outfit_profile(host: Any, *, date_key: str = "") -> dict[str, 
     profile = selection.get("profile") if isinstance(selection, Mapping) else None
     if not isinstance(profile, Mapping) or not profile:
         return {}
-
-    result: dict[str, str] = {}
-    for key in PHOTO_PROFILE_FIELDS:
-        value = _text(profile.get(key), PHOTO_PROFILE_LIMITS[key])
-        if value:
-            result[key] = value
-    look_id = _text(selection.get("look_id"), 80)
-    if look_id:
-        result["look_id"] = look_id
-    if scene:
-        result["scene"] = scene
-    weather = _text(_call(host, "_wardrobe_current_weather", ""), 32)
-    if weather:
-        result["weather"] = weather
-    return result
+    return _decorate(host, profile, look_id=selection.get("look_id"))
 
 
 __all__ = [

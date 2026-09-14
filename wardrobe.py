@@ -275,6 +275,7 @@ __all__ = [
     "render_generated_outfit",
     "render_worn_items",
     "outfit_photo_profile",
+    "outfit_photo_profile_from_items",
 ]
 
 
@@ -2274,6 +2275,25 @@ def render_generated_outfit(payload: Mapping[str, Any] | None) -> str:
         marker = "（贴身）" if key in OUTFIT_INTIMATE_FIELDS else ""
         lines.append(f"{_FIELD_LABELS_ZH.get(key, key)}：{value}{marker}")
     return "\n".join(lines)
+
+
+def outfit_photo_profile_from_items(
+    items: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, str]:
+    """Photo projection of *explicitly specified* items (dialogue outfit).
+
+    与规则裁决路径共用 :data:`SLOT_PROFILE_FIELDS` 与 :func:`_outfit_profile_text`，
+    贴身件照旧不进照片提示词（本会话换装也不行）。
+    """
+
+    profile: dict[str, str] = {}
+    for item in items or ():
+        if item.get("intimate"):
+            continue
+        field = SLOT_PROFILE_FIELDS.get(str(item.get("slot") or ""), "")
+        if field and field not in profile:
+            profile[field] = _outfit_profile_text(item)
+    return profile
 
 
 def outfit_photo_profile(payload: Mapping[str, Any] | None) -> dict[str, str]:

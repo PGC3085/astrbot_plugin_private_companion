@@ -27,6 +27,8 @@ class _Host:
         ])
         self.outfits = overrides.pop("outfits", [])
         self.raise_on = overrides.pop("raise_on", "")
+        # 本会话明确换装（作者的 dialogue_outfit_override）：默认没有。
+        self.intent = overrides.pop("intent", {})
 
     def _wardrobe_setting(self, key, default=None):
         return self.setting.get(key, default)
@@ -52,6 +54,59 @@ class _Host:
 
     def _wardrobe_current_weather(self):
         return "冷"
+
+    def _current_dialogue_outfit_override(self, *, user_id="", now=None):
+        self._guard("intent")
+        return dict(self.intent)
+
+    def _wardrobe_override_items(self, snapshot):
+        by_id = {row["id"]: row for row in self.items}
+        return [by_id[key] for key in (snapshot or {}).get("wardrobe_items", []) if key in by_id]
+
+
+class WardrobePhotoIntentTests(unittest.TestCase):
+    """本会话明确换装优先：用户说今天穿泳衣，照片就该是泳衣。"""
+
+    def test_intent_overrides_the_rotating_outfit(self) -> None:
+        host = _Host(
+            items=[
+                {"id": "w_top", "name": "米色针织开衫", "description": "宽松细针织", "slot": "upper"},
+                {"id": "w_swim", "name": "分体泳衣上装", "description": "运动款速干", "slot": "upper"},
+                {"id": "w_jeans", "name": "深蓝直筒牛仔裤", "description": "经典款", "slot": "lower"},
+            ],
+            intent={"instruction": "换上泳衣", "wardrobe_items": ["w_swim"]},
+        )
+        profile = resolve_daily_outfit_profile(host, date_key="2026-02-11")
+        self.assertEqual("分体泳衣上装，运动款速干", profile.get("top"))
+        self.assertNotIn("bottom", profile)
+
+    def test_intimate_items_never_reach_the_photo(self) -> None:
+        host = _Host(
+            items=[
+                {"id": "w_under", "name": "白色棉质内衣", "slot": "upper", "intimate": True},
+                {"id": "w_jeans", "name": "深蓝直筒牛仔裤", "slot": "lower"},
+            ],
+            intent={"instruction": "只穿内衣", "wardrobe_items": ["w_under", "w_jeans"]},
+        )
+        profile = resolve_daily_outfit_profile(host, date_key="2026-02-11")
+        self.assertNotIn("内衣", str(profile))
+        self.assertEqual("深蓝直筒牛仔裤", profile.get("bottom"))
+
+    def test_unresolvable_intent_falls_back_to_the_rotation(self) -> None:
+        # 衣柜里没有「JK 制服」这种只写了 instruction 的意图：照片交回轮换结果，
+        # 绝不凭空多出一件衣服。
+        host = _Host(intent={"instruction": "换上 JK 制服"})
+        profile = resolve_daily_outfit_profile(host, date_key="2026-02-11")
+        self.assertEqual("米色针织开衫，宽松细针织", profile.get("top"))
+
+    def test_intent_is_ignored_when_the_takeover_is_switched_off(self) -> None:
+        host = _Host(setting={"wardrobe_photo_source": "builtin"}, intent={"instruction": "换上泳衣", "wardrobe_items": ["w_top"]})
+        self.assertEqual({}, resolve_daily_outfit_profile(host, date_key="2026-02-11"))
+
+    def test_broken_intent_reader_degrades_to_the_rotation(self) -> None:
+        host = _Host(raise_on="intent", intent={"instruction": "换上泳衣"})
+        profile = resolve_daily_outfit_profile(host, date_key="2026-02-11")
+        self.assertEqual("米色针织开衫，宽松细针织", profile.get("top"))
 
 
 class WardrobePhotoBridgeTests(unittest.TestCase):
