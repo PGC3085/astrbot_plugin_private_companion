@@ -1392,8 +1392,8 @@ def _can_manage_private_companion(event) -> bool: ...     # main.py L20050 附�
 | 12998 | `pc_get_user_id_by_name` | 13000 | 按用户名查 ID |
 | 13011 | `pc_query_relation_person` | 13013 | 查询关系人 |
 | 13023 | `pc_get_specified_group_members` | 13025 | 查询指定群成员 |
-| 13176 | `pc_query_wardrobe_detail` | 13178 | 按需查看衣柜细节（今天这身 / 某部位 / 整份清单） |
-| 13196 | `pc_set_outfit_intent` | 13198 | 记录「本会话接下来穿什么」（仅主要用户） |
+| 13199 | `pc_query_wardrobe_detail` | 13201 | 按需查看衣柜细节（今天这身 / 某部位 / 整份清单） |
+| 13219 | `pc_set_outfit_intent` | 13221 | 记录「本会话接下来穿什么」（仅主要用户） |
 | 13036 | `pc_query_interaction` | 13038 | 查询互动状态 |
 | 13053 | `pc_relay_message` | 13055 | 中继消息 |
 | 13075 | `pc_send_to_group` | 13077 | 主动发群 |
