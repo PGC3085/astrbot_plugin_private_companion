@@ -92,6 +92,11 @@ _MISSING = object()
 _WARDROBE_VISION_TIMEOUT_SECONDS = 90.0
 _WARDROBE_VISION_MAX_IMAGES = 8
 
+# 推理型视觉模型会把 token 预算花在思考过程上，正文可能整个是空的
+# （实测 10 张里 4 张如此，finish_reason=length）。空返回时用这句
+# 「只要结论」的补语对同一个 Provider 再问一次，仍失败才换下一个候选。
+_WARDROBE_VISION_TERSE_SUFFIX = "\n\n请直接输出上面的字段，不要输出思考过程或额外说明。"
+
 
 class WardrobeMixin:
     """角色衣柜：配置、识图入库、提示词与命令。"""
@@ -931,6 +936,30 @@ class WardrobeMixin:
                     continue
                 text = str(getattr(result, "completion_text", result) or "").strip()
                 parsed = parse_wardrobe_image_reply(text)
+                if parsed is None and not text:
+                    # 完全空返回：多半是推理预算被思考过程吃光了，换提示词
+                    # 比换 Provider 更有效（同一条链路上其它候选往往是同一个模型）。
+                    try:
+                        retry_call = provider.text_chat(
+                            prompt=prompt + _WARDROBE_VISION_TERSE_SUFFIX,
+                            image_urls=image_urls,
+                        )
+                        retry_result = await asyncio.wait_for(
+                            retry_call, timeout=_WARDROBE_VISION_TIMEOUT_SECONDS
+                        )
+                        text = str(
+                            getattr(retry_result, "completion_text", retry_result) or ""
+                        ).strip()
+                        parsed = parse_wardrobe_image_reply(text)
+                    except asyncio.TimeoutError:
+                        failure = "识图超时，请稍后再试或换一张图。"
+                        logger.warning("衣柜识图重试超时: provider=%s", provider_id_candidate)
+                    except Exception as exc:
+                        logger.warning(
+                            "衣柜识图重试失败: provider=%s error=%s",
+                            provider_id_candidate,
+                            _single_line(exc, 160),
+                        )
                 if parsed is None:
                     logger.info(
                         "衣柜识图返回不可用结果: provider=%s preview=%s",

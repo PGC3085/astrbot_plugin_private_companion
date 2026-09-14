@@ -94,6 +94,7 @@ from astrbot_plugin_private_companion.wardrobe import (
 from astrbot_plugin_private_companion.wardrobe_runtime import (
     WARDROBE_PROMPT_KEY,
     WardrobeMixin,
+    _WARDROBE_VISION_TERSE_SUFFIX,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -398,6 +399,23 @@ class _WardrobeCommandHarness(_WardrobeHarness):
         return dict(self.describe_reply), ""
 
 
+class _EmptyFirstVisionHarness(_WardrobeHarness):
+    """按顺序吐出预设回复，用来演「第一次正文为空」的推理型视觉模型。"""
+
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__()
+        self.vision_replies = list(replies)
+
+    def _fake_text_chat(self, provider_id):
+        async def _call(*, prompt, image_urls, **kwargs):
+            self.vision_provider_calls.append(provider_id)
+            self.vision_prompts.append(prompt)
+            reply = self.vision_replies.pop(0) if self.vision_replies else ""
+            return SimpleNamespace(completion_text=reply)
+
+        return _call
+
+
 class WardrobeMixinTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.plugin = _WardrobeCommandHarness()
@@ -643,6 +661,36 @@ class WardrobeMixinTests(unittest.IsolatedAsyncioTestCase):
             ["vision-picked", "vision-config", "vision-default"],
             plugin._wardrobe_vision_candidates("", preferred="vision-picked"),
         )
+
+    async def test_empty_reply_is_retried_with_a_terse_prompt(self) -> None:
+        """推理型模型把预算花在思考上时正文会是空的，必须换提示词再问一次。"""
+
+        plugin = _EmptyFirstVisionHarness(["", "名称：风衣\n描述：黑色长款\n标签：外出"])
+        parsed, error = await plugin._wardrobe_describe_image(["/tmp/coat.png"])
+        self.assertEqual("", error)
+        assert parsed is not None
+        self.assertIn("风衣", parsed["name"])
+        self.assertEqual("黑色长款", parsed["description"])
+        # 同一个 Provider 重试，而不是直接跳到下一个候选。
+        self.assertEqual(["vision-default", "vision-default"], plugin.vision_provider_calls)
+        self.assertFalse(plugin.vision_prompts[0].endswith(_WARDROBE_VISION_TERSE_SUFFIX))
+        self.assertTrue(plugin.vision_prompts[1].endswith(_WARDROBE_VISION_TERSE_SUFFIX))
+
+    async def test_always_empty_reply_falls_through_instead_of_looping(self) -> None:
+        plugin = _EmptyFirstVisionHarness([])
+        parsed, error = await plugin._wardrobe_describe_image(["/tmp/coat.png"])
+        self.assertIsNone(parsed)
+        self.assertTrue(error)
+        # 每个候选各问两次：原始提示 + 精简提示，然后就放弃。
+        self.assertEqual(["vision-default", "vision-default"], plugin.vision_provider_calls)
+
+    async def test_unusable_text_is_not_retried(self) -> None:
+        """有正文但读不出衣物（模型明确说"无"）时不该白花一次调用。"""
+
+        plugin = _EmptyFirstVisionHarness(["无"])
+        parsed, _error = await plugin._wardrobe_describe_image(["/tmp/coat.png"])
+        self.assertIsNone(parsed)
+        self.assertEqual(["vision-default"], plugin.vision_provider_calls)
 
     def test_prompt_section_unaffected_by_image_prompt(self) -> None:
         self.plugin.config["wardrobe_tendency"] = "偏爱针织"
