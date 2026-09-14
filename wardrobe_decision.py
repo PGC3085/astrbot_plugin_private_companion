@@ -18,6 +18,11 @@
 两者刻意独立：一件低优先级的衣物可以因为"最后才提到"而排在文本末尾，
 一件高优先级的衣物也可以出现在文本最前 —— "要不要"与"放哪里"不互相污染。
 
+priority 内部还可以再分层：:func:`score_priority` 给的是"第几等"（tier），
+:func:`fair_priority` 再把 tier 与"这是本部位第几件"压成一个数。于是同 tier 内各
+部位的"第 0 件"排在所有"第 1 件"前面，贪心装箱自然变成轮转 —— 件少的部位
+（鞋、配件）不会被件多又靠前的部位饿死。
+
 三趟式装箱（借鉴 RisuAI 世界书的预算分配，出处同上）
 ----------------------------------------------------
 1. **排序**：按 priority 降序（同分保持输入顺序，靠稳定排序，不掷骰子）；
@@ -73,12 +78,18 @@ PRIORITY_INTIMATE = 5
 # weight 的档位间距：留出在两档之间插一档的空间（例如给"外套"单独一档）。
 WEIGHT_STEP = 10
 
+# 同 tier 内"公平轮"的放大系数：必须大于任何部位可能的最大序号，否则序号会顶穿
+# tier，让件多的部位反过来压过更高一等的条目。衣柜条目上限 40（wardrobe.py 的
+# WARDROBE_MAX_ITEMS），取 100 留足余量。
+FAIRNESS_SCALE = 100
+
 __all__ = [
     "DECISION_VERSION",
     "DROP_REASON_BUDGET",
     "DROP_REASON_LIMIT",
     "DROP_REASON_OVERSIZE",
     "DROP_REASONS",
+    "FAIRNESS_SCALE",
     "PRIORITY_CLASSIFIED",
     "PRIORITY_DESCRIBED",
     "PRIORITY_FRESH",
@@ -89,6 +100,7 @@ __all__ = [
     "entry_field",
     "entry_priority",
     "entry_weight",
+    "fair_priority",
     "order_by_priority",
     "order_by_weight",
     "pack_entries",
@@ -168,6 +180,32 @@ def score_priority(
         + (PRIORITY_FRESH if fresh else 0)
         + (PRIORITY_INTIMATE if intimate else 0)
     )
+
+
+def fair_priority(tier: Any, rank: Any, *, scale: int = FAIRNESS_SCALE) -> int:
+    """把 tier（第几等）与 rank（同 tier 里第几件）压成一个可比较的 priority。
+
+    高 tier 永远压过低 tier：只要 `rank < scale`，`tier * scale - rank` 就不会
+    跨 tier 越级；同 tier 内 rank 小的在前。
+
+    这一层解决的是"整段部位被饿死"：渲染层把 rank 当作**部位内序号**（该部位在
+    衣柜里的第几件，0 起），于是各部位的"第 0 件"排在所有"第 1 件"前面，贪心
+    装箱自然退化成轮转，预算被均匀铺到每个部位 —— 鞋、配件不会因为排序靠后
+    一件不剩，件多的部位也不会独占预算。
+
+    rank 超出 `scale` 时夹到 `scale - 1`：宁可让它们同分（退回输入顺序），
+    也不能顶穿 tier；负数 rank 按 0 处理。
+    """
+
+    span = clean_score(scale, FAIRNESS_SCALE)
+    if span <= 0:
+        span = FAIRNESS_SCALE
+    index = clean_score(rank, 0)
+    if index < 0:
+        index = 0
+    elif index >= span:
+        index = span - 1
+    return clean_score(tier, 0) * span - index
 
 
 def weight_for_rank(rank: Any, *, explicit: Any = None, step: int = WEIGHT_STEP) -> int:

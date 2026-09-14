@@ -34,9 +34,15 @@ from datetime import date
 from typing import Any
 
 try:  # 包内导入：插件运行时与 pytest 都按包加载本模块
-    from .wardrobe_decision import pack_entries, score_priority, weight_for_rank
+    from .wardrobe_decision import (
+        fair_priority,
+        pack_entries,
+        score_priority,
+        weight_for_rank,
+    )
 except ImportError:  # scripts/ 下的离线工具把本模块当顶层模块加载（插件根直插 sys.path）
     from wardrobe_decision import (  # type: ignore[no-redef]
+        fair_priority,
         pack_entries,
         score_priority,
         weight_for_rank,
@@ -936,11 +942,15 @@ def _wardrobe_notice(count: int) -> str:
     return f"（另有 {count} 件未列出）"
 
 
-def _render_candidate(item: Mapping[str, Any]) -> dict[str, Any]:
+def _render_candidate(item: Mapping[str, Any], *, slot_index: int = 0) -> dict[str, Any]:
     """把一个衣物条目打成装箱候选：渲染行 + priority + weight。
 
     行文本与长度必须同源：`line` 就是最终写进提示词的那一行，装箱按
     `len(line) + 1`（含换行）计价，所以"预算内"与"实际渲染"不会是两套算法。
+
+    `slot_index` 是这件衣物在**自己部位内**的序号（0 起），用于 priority 的
+    次级排序键：同 tier 时所有部位的"第 0 件"先被收下，再轮到各自的"第 1 件"……
+    否则件多又靠前的部位（例如上身）会把预算吃光，鞋和配件一件不剩。
     """
 
     slot = str(item.get("slot") or "")
@@ -954,11 +964,22 @@ def _render_candidate(item: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "slot": slot,
         "line": line,
-        # priority：预算不足时先丢谁 —— 已分类 > 未分类，有描述 > 无描述。
-        "priority": score_priority(
-            classified=bool(slot),
-            described=bool(detail),
-            intimate=bool(item.get("intimate")),
+        # priority：预算不足时先丢谁 —— 已分类 > 未分类、有描述 > 无描述决定 tier，
+        # 同 tier 再按"这是本部位第几件"轮转（fair_priority："公平"是次级键，
+        # 排在 tier 之下，所以鞋与配件不会被件多的上身饿死）。
+        #
+        # 贴身件与"刚穿过"**不**在这里加分：加了就会跳到所有部位的第 0 件之前，
+        # 把轮转打破（实测预设衣柜 cap=300 时会变成上身 3 件、整身/足部/配件各 1 件，
+        # 极差 2 而不是 1）。贴身是一条**选择**轴（见 select_wardrobe_outfit），
+        # 渲染只需要照旧打上（贴身）标记，不必抢预算；渲染清单也不区分刚穿过与否。
+        "priority": fair_priority(
+            score_priority(
+                classified=bool(slot),
+                described=bool(detail),
+                fresh=False,
+                intimate=False,
+            ),
+            slot_index,
         ),
         # weight：最终文本里谁更靠下（数值大者在后）。
         "weight": weight_for_rank(_RENDER_SLOT_RANKS.get(slot, len(_RENDER_SLOT_ORDER))),
@@ -995,7 +1016,14 @@ def render_wardrobe_block(
     if not normalized:
         return _truncate_block("\n".join(lines), max_chars)
     lines.append("衣柜里的具体衣物：")
-    candidates = [_render_candidate(item) for item in normalized]
+    # 部位内序号按衣柜里的原始顺序数（0 起），它是装箱时的轮转次级键。
+    slot_cursor: dict[str, int] = {}
+    candidates: list[dict[str, Any]] = []
+    for item in normalized:
+        slot = str(item.get("slot") or "")
+        index = slot_cursor.get(slot, 0)
+        slot_cursor[slot] = index + 1
+        candidates.append(_render_candidate(item, slot_index=index))
     # 每条候选按「正文 + 换行」计价，而最后一行没有换行，所以可用额度比 max_chars 多 1。
     available = max_chars + 1 - sum(len(line) + 1 for line in lines)
     group_cost = {slot: len(_slot_header(slot)) + 1 for slot in _RENDER_SLOT_ORDER}
