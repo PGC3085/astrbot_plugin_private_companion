@@ -7,8 +7,30 @@ window.PrivateCompanionWardrobe = (() => {
   const UPLOAD_MIMES = ["image/png", "image/jpeg", "image/webp"];
   const UPLOAD_MAX_BYTES = 12 * 1024 * 1024;
 
+  const MAX_OUTFITS = 30;
+  const MAX_OUTFIT_NAME = 40;
+  const MAX_OUTFIT_STYLE = 300;
+  const OUTFIT_KINDS = ["style", "bundle"];
+  const OUTFIT_KIND_LABELS = { style: "风格", bundle: "组合" };
+  const OWNERSHIPS = ["owned", "reference"];
+  const OWNERSHIP_LABELS = { owned: "自有", reference: "参考" };
+  // 与后端 WARDROBE_IMAGE_KINDS 对应；kind 为空表示这条素材还没识图。
+  const DRAFT_KIND_LABELS = { item: "散件", outfit: "整套", reference: "参考整套", none: "无法辨认" };
+  const SLOT_OPTIONS = [
+    ["", "未分类"],
+    ["upper", "上身"],
+    ["lower", "下身"],
+    ["whole", "整身"],
+    ["feet", "足部"],
+    ["extra", "配件"],
+  ];
+
   let items = [];
+  let outfits = [];
+  let drafts = [];
   let bound = false;
+  let outfitsBound = false;
+  let draftsBound = false;
   let busy = false;
 
   function cleanText(value, limit) {
@@ -89,6 +111,88 @@ window.PrivateCompanionWardrobe = (() => {
       }
     }
     return [];
+  }
+
+  function randomOutfitId() {
+    const buffer = new Uint8Array(6);
+    if (window.crypto?.getRandomValues) window.crypto.getRandomValues(buffer);
+    else for (let i = 0; i < buffer.length; i += 1) buffer[i] = Math.floor(Math.random() * 256);
+    return "outfit_" + Array.from(buffer, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function cleanOutfitItems(value) {
+    const raw = Array.isArray(value) ? value : [];
+    const result = [];
+    for (const entry of raw) {
+      const text = cleanText(entry, 80);
+      if (text && !result.includes(text)) result.push(text);
+      if (result.length >= 8) break;
+    }
+    return result;
+  }
+
+  function normalizeOutfit(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const name = cleanText(raw.name ?? raw.title, MAX_OUTFIT_NAME);
+    const style = cleanText(raw.style ?? raw.description ?? raw.note, MAX_OUTFIT_STYLE);
+    const linkedItems = cleanOutfitItems(raw.items);
+    if (!name && !style && !linkedItems.length) return null;
+    const kindText = cleanText(raw.kind, 16).toLowerCase();
+    let kind = OUTFIT_KINDS.includes(kindText) ? kindText : (linkedItems.length ? "bundle" : "style");
+    // 声称是组合却没有件，等同于空组合 —— 与后端一样降级成风格。
+    if (kind === "bundle" && !linkedItems.length) kind = "style";
+    const row = {
+      id: cleanText(raw.id, 80) || randomOutfitId(),
+      name: name || cleanText(style, 12) || "未命名整套",
+      kind,
+      style,
+      items: linkedItems,
+      ownership: OWNERSHIPS.includes(cleanText(raw.ownership, 16).toLowerCase())
+        ? cleanText(raw.ownership, 16).toLowerCase()
+        : "owned",
+    };
+    // 面板不编辑的字段原样带回去：否则「改个名字再保存」会把整套关联的
+    // 素材与创建时间一起洗掉。
+    for (const key of ["precision", "asset_ids", "created_at", "updated_at", "version"]) {
+      if (raw[key] !== undefined && raw[key] !== null) row[key] = raw[key];
+    }
+    return row;
+  }
+
+  function normalizeOutfits(value) {
+    const list = Array.isArray(value) ? value : [];
+    const result = [];
+    const seenIds = new Set();
+    const seenNames = new Set();
+    for (const raw of list) {
+      const row = normalizeOutfit(raw);
+      if (!row || seenIds.has(row.id)) continue;
+      const key = nameKey(row.name);
+      if (key && seenNames.has(key)) continue;
+      seenIds.add(row.id);
+      if (key) seenNames.add(key);
+      result.push(row);
+      if (result.length >= MAX_OUTFITS) break;
+    }
+    return result;
+  }
+
+  function parseStoredOutfits(raw) {
+    if (Array.isArray(raw)) return normalizeOutfits(raw);
+    const text = String(raw ?? "").trim();
+    if (!text || !text.startsWith("[") || !text.endsWith("]")) return [];
+    try {
+      return normalizeOutfits(JSON.parse(text));
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  function outfitMeta(row) {
+    const kind = OUTFIT_KIND_LABELS[row.kind] || row.kind || "风格";
+    const ownership = OWNERSHIP_LABELS[row.ownership] || row.ownership || "自有";
+    const linked = row.items.length ? "引用 " + row.items.length + " 件散件" : "不引用散件";
+    return [kind, ownership, linked].join(" · ");
   }
 
   const DEFAULT_IMAGE_PROMPT = [
@@ -347,6 +451,57 @@ window.PrivateCompanionWardrobe = (() => {
     if (counter) counter.textContent = `${items.length} / ${MAX_ITEMS}`;
   }
 
+  function renderOutfitList(context) {
+    const document = contextDocument(context);
+    const list = document?.querySelector("[data-wardrobe-outfit-list]");
+    if (!list) return;
+    list.textContent = "";
+    if (!outfits.length) {
+      const empty = document.createElement("p");
+      empty.className = "wardrobe-empty";
+      empty.textContent = "还没有整套。识图判定为整套或参考的图片会进这里，也可以手动添加。";
+      list.appendChild(empty);
+    }
+    outfits.forEach((row, index) => {
+      const element = document.createElement("div");
+      element.className = "wardrobe-outfit";
+      element.dataset.wardrobeOutfitId = row.id;
+
+      const body = document.createElement("div");
+      body.className = "wardrobe-outfit-body";
+      const title = document.createElement("strong");
+      title.textContent = (index + 1) + ". " + row.name;
+      body.appendChild(title);
+      if (row.style) {
+        const detail = document.createElement("p");
+        detail.textContent = row.style;
+        body.appendChild(detail);
+      }
+      const meta = document.createElement("small");
+      meta.textContent = outfitMeta(row);
+      body.appendChild(meta);
+      element.appendChild(body);
+
+      const actions = document.createElement("div");
+      actions.className = "wardrobe-outfit-actions";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "删除";
+      remove.dataset.wardrobeOutfitRemove = row.id;
+      actions.appendChild(remove);
+      element.appendChild(actions);
+
+      list.appendChild(element);
+    });
+    const counter = document.querySelector("[data-wardrobe-outfit-count]");
+    if (counter) counter.textContent = outfits.length + " / " + MAX_OUTFITS;
+  }
+
+  function syncOutfitHiddenInput(context) {
+    const input = contextDocument(context)?.querySelector("[data-wardrobe-outfits-input]");
+    if (input) input.value = JSON.stringify(outfits);
+  }
+
   function syncHiddenInput(context) {
     const input = contextDocument(context)?.querySelector("[data-wardrobe-items-input]");
     if (input) input.value = JSON.stringify(items);
@@ -355,6 +510,8 @@ window.PrivateCompanionWardrobe = (() => {
   function commit(context) {
     syncHiddenInput(context);
     renderList(context);
+    syncOutfitHiddenInput(context);
+    renderOutfitList(context);
   }
 
   function readDraft(context) {
@@ -538,14 +695,444 @@ window.PrivateCompanionWardrobe = (() => {
     } else {
       items = parseStoredItems(input?.value);
     }
+    // 整套走同一套规则：设置是权威来源，表单草稿只在键缺失时兜底。
+    const outfitsInput = document.querySelector("[data-wardrobe-outfits-input]");
+    if (Object.prototype.hasOwnProperty.call(settings, "wardrobe_outfits")) {
+      outfits = parseStoredOutfits(settings.wardrobe_outfits);
+    } else {
+      outfits = parseStoredOutfits(outfitsInput?.value);
+    }
     const limit = document.querySelector("[data-wardrobe-image-limit]");
     if (limit) limit.textContent = String(currentLimit(context));
     renderProviderControl(context);
     renderPromptEditor(context);
     bindVisionSettings(context);
     bindOutfitPreview(context);
+    bindOutfitActions(context);
+    bindDraftActions(context);
     commit(context);
     bindActions(context);
+    // 草稿队列是异步的：读不到只影响这一块，不该挡住衣柜本身。
+    void refreshDrafts(context, { silent: true });
+  }
+
+  // ------------------------------------------------------------------
+  // 整套：新增 / 删除
+  // ------------------------------------------------------------------
+
+  function readOutfitDraft(context) {
+    const document = contextDocument(context);
+    return {
+      name: cleanText(document?.querySelector("[data-wardrobe-outfit-name]")?.value, MAX_OUTFIT_NAME),
+      style: cleanText(document?.querySelector("[data-wardrobe-outfit-style]")?.value, MAX_OUTFIT_STYLE),
+      ownership: cleanText(document?.querySelector("[data-wardrobe-outfit-ownership]")?.value, 16).toLowerCase(),
+    };
+  }
+
+  function clearOutfitDraft(context) {
+    const document = contextDocument(context);
+    const name = document?.querySelector("[data-wardrobe-outfit-name]");
+    const style = document?.querySelector("[data-wardrobe-outfit-style]");
+    if (name) name.value = "";
+    if (style) style.value = "";
+  }
+
+  function upsertOutfit(context, draft) {
+    const name = cleanText(draft.name, MAX_OUTFIT_NAME) || cleanText(draft.style, 12);
+    if (!name) return { ok: false, message: "请先填写整套名称或风格描述。" };
+    const ownership = OWNERSHIPS.includes(cleanText(draft.ownership, 16).toLowerCase())
+      ? cleanText(draft.ownership, 16).toLowerCase()
+      : "owned";
+    const existingIndex = outfits.findIndex((row) => nameKey(row.name) === nameKey(name));
+    // 面板只加「风格整套」：组合整套要引用散件，那是识图与命令路径的产物；
+    // 手填一个没有件的组合会被后端降级成风格，不如这里就不提供。
+    const payload = {
+      id: existingIndex >= 0 ? outfits[existingIndex].id : randomOutfitId(),
+      name,
+      kind: "style",
+      style: cleanText(draft.style, MAX_OUTFIT_STYLE),
+      items: existingIndex >= 0 ? outfits[existingIndex].items : [],
+      ownership,
+    };
+    if (existingIndex >= 0) outfits.splice(existingIndex, 1, { ...outfits[existingIndex], ...payload });
+    else {
+      if (outfits.length >= MAX_OUTFITS) return { ok: false, message: "最多 " + MAX_OUTFITS + " 套，请先删除不用的整套。" };
+      outfits.push(payload);
+    }
+    return { ok: true, replaced: existingIndex >= 0, name };
+  }
+
+  function upsertLocalOutfit(row) {
+    const normalized = normalizeOutfit(row);
+    if (!normalized) return;
+    const key = nameKey(normalized.name);
+    const index = outfits.findIndex((entry) => entry.id === normalized.id || (key && nameKey(entry.name) === key));
+    if (index >= 0) outfits.splice(index, 1, normalized);
+    else outfits.push(normalized);
+  }
+
+  function adoptItem(raw) {
+    const normalized = normalizeItem(raw);
+    if (!normalized) return null;
+    // 后端确认落库的散件带着面板不编辑的字段（素材引用、创建时间），
+    // 原样带回去，否则下一次保存会把图片关联洗掉。
+    for (const key of ["precision", "asset_ids", "ownership", "created_at", "updated_at", "version"]) {
+      if (raw?.[key] !== undefined && raw?.[key] !== null) normalized[key] = raw[key];
+    }
+    return normalized;
+  }
+
+  function upsertLocalItem(row) {
+    const normalized = adoptItem(row);
+    if (!normalized) return;
+    const key = nameKey(normalized.name);
+    const index = items.findIndex((entry) => entry.id === normalized.id || (key && nameKey(entry.name) === key));
+    if (index >= 0) items.splice(index, 1, normalized);
+    else items.push(normalized);
+  }
+
+  function setBlockStatus(context, selector, message, tone = "") {
+    const node = contextDocument(context)?.querySelector(selector);
+    if (!node) return;
+    node.textContent = message || "";
+    node.dataset.tone = tone;
+  }
+
+  function bindOutfitActions(context) {
+    const document = contextDocument(context);
+    const manager = document?.querySelector("[data-wardrobe-outfit-manager]");
+    if (!manager || outfitsBound) return;
+    outfitsBound = true;
+    manager.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.dataset.wardrobeOutfitRemove) {
+        outfits = outfits.filter((row) => row.id !== target.dataset.wardrobeOutfitRemove);
+        commit(context);
+        setBlockStatus(context, "[data-wardrobe-outfit-status]", "已移除，记得点保存。", "ok");
+        return;
+      }
+      if (!target.hasAttribute("data-wardrobe-outfit-add")) return;
+      const result = upsertOutfit(context, readOutfitDraft(context));
+      if (!result.ok) {
+        setBlockStatus(context, "[data-wardrobe-outfit-status]", result.message, "error");
+        return;
+      }
+      commit(context);
+      clearOutfitDraft(context);
+      setBlockStatus(
+        context,
+        "[data-wardrobe-outfit-status]",
+        result.replaced ? "已更新「" + result.name + "」。记得点保存。" : "已加入「" + result.name + "」。记得点保存。",
+        "ok",
+      );
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // 草稿队列（素材 → 散件/整套 的人工确认）
+  //
+  // 面板不自己判断「这张图该进哪个库」：确认请求交给后端，落库结果
+  // （payload.row）再合并回本地列表，所以隐藏字段始终跟着服务端走，
+  // 不会出现「刚确认完，一保存又把它洗掉」。
+  // ------------------------------------------------------------------
+
+  const DRAFTS_STATUS = "[data-wardrobe-drafts-status]";
+
+  function apiPayload(result) {
+    return result?.data && typeof result.data === "object" ? result.data : result;
+  }
+
+  function normalizeDraft(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const assetId = cleanText(raw.asset_id, 80);
+    if (!assetId) return null;
+    const kind = cleanText(raw.kind, 32);
+    const slot = cleanText(raw.slot, 20);
+    return {
+      asset_id: assetId,
+      kind,
+      kind_label: cleanText(raw.kind_label, 20) || DRAFT_KIND_LABELS[kind] || kind || "待识图",
+      name: cleanText(raw.name, MAX_NAME),
+      description: cleanText(raw.description, MAX_DESCRIPTION),
+      slot,
+      origin_label: cleanText(raw.origin_label, 32) || cleanText(raw.origin, 32) || "未知来源",
+      has_draft: raw.has_draft === true,
+      has_image: raw.has_image === true,
+    };
+  }
+
+  function labeledField(document, labelText, control) {
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    label.appendChild(control);
+    return label;
+  }
+
+  function draftSlotSelect(document, row) {
+    const select = document.createElement("select");
+    select.dataset.wardrobeDraftSlot = row.asset_id;
+    SLOT_OPTIONS.forEach(([value, text]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      if (value === row.slot) option.selected = true;
+      select.appendChild(option);
+    });
+    return select;
+  }
+
+  function draftsPanelOpen(context) {
+    return contextDocument(context)?.querySelector("[data-wardrobe-drafts]")?.open === true;
+  }
+
+  async function loadDraftThumb(context, image, placeholder, assetId) {
+    try {
+      const postJson = context?.postJson;
+      if (!postJson) throw new Error("panel has no postJson");
+      const payload = apiPayload(await postJson("/wardrobe/asset-image", { asset_id: assetId }));
+      const url = String(payload?.data_url || "");
+      if (!url) throw new Error("empty data url");
+      image.src = url;
+      image.hidden = false;
+      if (placeholder) placeholder.hidden = true;
+    } catch (_error) {
+      // 缩略图只是锦上添花：读不到就留着占位符，确认与丢弃照常可用。
+      if (placeholder) placeholder.textContent = "无预览";
+    }
+  }
+
+  function draftRow(context, document, row, withThumb) {
+    const element = document.createElement("div");
+    element.className = "wardrobe-draft";
+    element.dataset.wardrobeDraftId = row.asset_id;
+    if (!row.has_draft) element.dataset.wardrobeDraftPending = "1";
+
+    const thumb = document.createElement("div");
+    thumb.className = "wardrobe-draft-thumb";
+    const placeholder = document.createElement("span");
+    if (withThumb && row.has_image) {
+      const image = document.createElement("img");
+      image.alt = "";
+      image.hidden = true;
+      image.dataset.wardrobeDraftThumb = row.asset_id;
+      placeholder.textContent = "…";
+      thumb.append(image, placeholder);
+      void loadDraftThumb(context, image, placeholder, row.asset_id);
+    } else {
+      // 折叠时只拉清单、不拉图片：几百条素材也不该在打开面板时炸出一串请求。
+      placeholder.textContent = row.has_image ? "展开预览" : "无图";
+      thumb.appendChild(placeholder);
+    }
+    element.appendChild(thumb);
+
+    const body = document.createElement("div");
+    body.className = "wardrobe-draft-body";
+    const meta = document.createElement("small");
+    meta.className = "wardrobe-draft-meta";
+    meta.textContent = [row.asset_id, row.kind_label, "来自" + row.origin_label].join(" · ");
+    body.appendChild(meta);
+
+    const fields = document.createElement("div");
+    fields.className = "wardrobe-draft-fields";
+    const name = document.createElement("input");
+    name.type = "text";
+    name.maxLength = MAX_NAME;
+    name.value = row.name;
+    name.placeholder = "确认后写进衣柜的名称";
+    name.dataset.wardrobeDraftName = row.asset_id;
+    fields.appendChild(labeledField(document, "名称", name));
+    fields.appendChild(labeledField(document, "部位", draftSlotSelect(document, row)));
+    const description = document.createElement("textarea");
+    description.rows = 2;
+    description.maxLength = MAX_DESCRIPTION;
+    description.value = row.description;
+    description.placeholder = "款式、颜色、材质、版型与明显细节";
+    description.dataset.wardrobeDraftDescription = row.asset_id;
+    fields.appendChild(
+      labeledField(document, row.kind && row.kind !== "item" ? "风格描述" : "描述", description),
+    );
+    body.appendChild(fields);
+
+    const actions = document.createElement("div");
+    actions.className = "wardrobe-draft-actions";
+    const apply = document.createElement("button");
+    apply.type = "button";
+    apply.className = "secondary-button";
+    apply.textContent = "确认";
+    apply.dataset.wardrobeDraftApply = row.asset_id;
+    const reject = document.createElement("button");
+    reject.type = "button";
+    reject.className = "secondary-button";
+    reject.textContent = "丢弃";
+    reject.dataset.wardrobeDraftReject = row.asset_id;
+    if (!row.has_draft || row.kind === "none") {
+      apply.disabled = true;
+      const hint = document.createElement("small");
+      hint.className = "wardrobe-draft-hint";
+      hint.textContent = row.kind === "none" ? "识图没认出衣物，建议丢弃。" : "等识图出草稿后才能确认。";
+      actions.appendChild(hint);
+    }
+    actions.append(apply, reject);
+    body.appendChild(actions);
+    element.appendChild(body);
+    return element;
+  }
+
+  function renderDraftList(context) {
+    const document = contextDocument(context);
+    const list = document?.querySelector("[data-wardrobe-draft-list]");
+    const counter = document?.querySelector("[data-wardrobe-drafts-count]");
+    if (counter) counter.textContent = String(drafts.length);
+    if (!list) return;
+    list.textContent = "";
+    if (!drafts.length) {
+      const empty = document.createElement("p");
+      empty.className = "wardrobe-empty";
+      empty.textContent = "队列是空的：要么还没导入素材，要么都已确认或丢弃。";
+      list.appendChild(empty);
+      return;
+    }
+    const withThumb = draftsPanelOpen(context);
+    drafts.forEach((row) => list.appendChild(draftRow(context, document, row, withThumb)));
+  }
+
+  function draftOverrides(context, assetId) {
+    const document = contextDocument(context);
+    let host = null;
+    (document?.querySelectorAll?.("[data-wardrobe-draft-id]") || []).forEach((node) => {
+      if (node?.dataset?.wardrobeDraftId === assetId) host = node;
+    });
+    if (!host) return {};
+    return {
+      name: cleanText(host.querySelector("[data-wardrobe-draft-name]")?.value, MAX_NAME),
+      description: cleanText(host.querySelector("[data-wardrobe-draft-description]")?.value, MAX_DESCRIPTION),
+      slot: cleanText(host.querySelector("[data-wardrobe-draft-slot]")?.value, 20),
+    };
+  }
+
+  function applyConfirmedRow(context, payload) {
+    const row = payload?.row;
+    if (!payload?.ok || !row || typeof row !== "object") return;
+    const kind = String(payload.kind || "");
+    if (kind === "outfit" || kind === "reference") upsertLocalOutfit(row);
+    else upsertLocalItem(row);
+    commit(context);
+  }
+
+  async function refreshDrafts(context, options = {}) {
+    const document = contextDocument(context);
+    const postJson = context?.postJson;
+    if (!document || !postJson) return;
+    const silent = options.silent === true;
+    if (!silent) setBlockStatus(context, DRAFTS_STATUS, "正在读取草稿队列…");
+    try {
+      const payload = apiPayload(await postJson("/wardrobe/drafts", {})) || {};
+      const rows = Array.isArray(payload.drafts) ? payload.drafts : [];
+      drafts = rows.map(normalizeDraft).filter(Boolean);
+      renderDraftList(context);
+      if (!silent) {
+        const ready = drafts.filter((row) => row.has_draft).length;
+        setBlockStatus(
+          context,
+          DRAFTS_STATUS,
+          drafts.length ? "待确认 " + drafts.length + " 项（可确认 " + ready + " 项）。" : "队列是空的。",
+          "ok",
+        );
+      }
+    } catch (error) {
+      if (!silent) setBlockStatus(context, DRAFTS_STATUS, error?.message || "读取草稿队列失败，请稍后再试。", "error");
+    }
+  }
+
+  async function confirmDraft(context, assetId) {
+    const postJson = context?.postJson;
+    if (!postJson) return;
+    setBlockStatus(context, DRAFTS_STATUS, "正在确认…");
+    try {
+      const payload = apiPayload(
+        await postJson("/wardrobe/draft-apply", { asset_id: assetId, overrides: draftOverrides(context, assetId) }),
+      );
+      applyConfirmedRow(context, payload);
+      await refreshDrafts(context, { silent: true });
+      setBlockStatus(context, DRAFTS_STATUS, "已确认「" + (payload?.name || assetId) + "」。", "ok");
+    } catch (error) {
+      setBlockStatus(context, DRAFTS_STATUS, error?.message || "确认失败，请稍后再试。", "error");
+    }
+  }
+
+  async function rejectDraft(context, assetId) {
+    const postJson = context?.postJson;
+    if (!postJson) return;
+    setBlockStatus(context, DRAFTS_STATUS, "正在丢弃…");
+    try {
+      await postJson("/wardrobe/draft-reject", { asset_id: assetId });
+      await refreshDrafts(context, { silent: true });
+      setBlockStatus(context, DRAFTS_STATUS, "已丢弃这条草稿，素材不会进衣柜。", "ok");
+    } catch (error) {
+      setBlockStatus(context, DRAFTS_STATUS, error?.message || "丢弃失败，请稍后再试。", "error");
+    }
+  }
+
+  async function applyAllDrafts(context) {
+    const postJson = context?.postJson;
+    if (!postJson) return;
+    const targets = drafts.filter((row) => row.has_draft && row.kind !== "none");
+    if (!targets.length) {
+      setBlockStatus(context, DRAFTS_STATUS, "没有可确认的草稿（等识图的项要先跑识图）。", "error");
+      return;
+    }
+    setBlockStatus(context, DRAFTS_STATUS, "正在确认 " + targets.length + " 项…");
+    let applied = 0;
+    const failures = [];
+    // 串行：衣柜落盘是「读-改-写」，并发确认会互相覆盖，最后只剩一条。
+    for (const row of targets) {
+      try {
+        const payload = apiPayload(
+          await postJson("/wardrobe/draft-apply", {
+            asset_id: row.asset_id,
+            overrides: draftOverrides(context, row.asset_id),
+          }),
+        );
+        applyConfirmedRow(context, payload);
+        applied += 1;
+      } catch (error) {
+        failures.push((row.name || row.asset_id) + "：" + (error?.message || "确认失败"));
+      }
+    }
+    await refreshDrafts(context, { silent: true });
+    const suffix = failures.length ? "；" + failures.length + " 项失败：" + failures.slice(0, 3).join("；") : "";
+    setBlockStatus(context, DRAFTS_STATUS, "已确认 " + applied + " 项" + suffix, failures.length ? "error" : "ok");
+  }
+
+  function bindDraftActions(context) {
+    const document = contextDocument(context);
+    const root = document?.querySelector("[data-wardrobe-drafts]");
+    if (!root || draftsBound) return;
+    draftsBound = true;
+    root.addEventListener("toggle", () => {
+      // 展开时才拉缩略图：没打开这一块的人不必为此付一串请求。
+      if (root.open) void refreshDrafts(context);
+    });
+    root.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.hasAttribute("data-wardrobe-drafts-refresh")) {
+        void refreshDrafts(context);
+        return;
+      }
+      if (target.hasAttribute("data-wardrobe-drafts-apply-all")) {
+        void applyAllDrafts(context);
+        return;
+      }
+      if (target.dataset.wardrobeDraftApply) {
+        void confirmDraft(context, target.dataset.wardrobeDraftApply);
+        return;
+      }
+      if (target.dataset.wardrobeDraftReject) {
+        void rejectDraft(context, target.dataset.wardrobeDraftReject);
+      }
+    });
   }
 
   // ------------------------------------------------------------------
@@ -721,5 +1308,11 @@ window.PrivateCompanionWardrobe = (() => {
     hydrateWardrobePanel,
     syncWardrobeFromSettings: hydrateWardrobePanel,
     wardrobeItemsForTest: () => items.slice(),
+    wardrobeOutfitsForTest: () => outfits.map((row) => ({ ...row })),
+    wardrobeDraftsForTest: () => drafts.map((row) => ({ ...row })),
+    refreshWardrobeDrafts: (context) => refreshDrafts(context),
+    confirmWardrobeDraft: (context, assetId) => confirmDraft(context, assetId),
+    rejectWardrobeDraft: (context, assetId) => rejectDraft(context, assetId),
+    applyAllWardrobeDrafts: (context) => applyAllDrafts(context),
   };
 })();
