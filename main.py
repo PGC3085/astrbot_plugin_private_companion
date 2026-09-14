@@ -13213,6 +13213,30 @@ class PrivateCompanionPlugin(
         if self is None or self._proactive_only_blocks_passive_event(event, "pc_tools"):
             return '{"status":"disabled","message":"主动消息专用模式下，普通被动回复不可使用 Private Companion 工具。"}'
         return self._wardrobe_detail_reply(scope=scope, slot=slot)
+    @filter.llm_tool(name="pc_set_outfit_intent")
+    @_multi_persona_event_context
+    async def pc_set_outfit_intent(
+        self,
+        event: AstrMessageEvent,
+        intent: str = "",
+        items: str = "",
+        outfit: str = "",
+    ) -> str:
+        """记录角色「本会话接下来穿什么」。用户明确要求换装、或剧情已经写出换衣过程时调用。
+
+        记下之后，后续对话、日程与生图都以这套服装为准，直到用户再次换装，或今天结束
+        （最长 12 小时）。只是想了解衣柜里有什么，请用 pc_query_wardrobe_detail，不要用本工具。
+
+        Args:
+            intent(string): 一句话说明换成什么，用用户原话最好，例如「换上泳衣」「今天想穿得清爽一点」。没有具体衣物时也要填这一项。
+            items(string): 可选。衣柜里具体衣物的名称或编号，多个用逗号或顿号分隔，例如「浅蓝条纹衬衫,深蓝直筒牛仔裤」。只填你确认存在于衣柜里的；衣柜里没有的衣物不要填在这里，写进 intent 即可。
+            outfit(string): 可选。整套的名称或编号，例如「通勤三件套」。与 items 同时给出时以整套为准。
+        """
+        if self is None or self._proactive_only_blocks_passive_event(event, "pc_tools"):
+            return '{"status":"disabled","message":"主动消息专用模式下，普通被动回复不可使用 Private Companion 工具。"}'
+        return self._wardrobe_intent_reply(
+            intent, items=items, outfit=outfit, user=self._wardrobe_intent_user(event)
+        )
     @filter.llm_tool(name="pc_query_interaction")
     @_multi_persona_event_context
     async def pc_query_interaction(self, event: AstrMessageEvent, **kwargs) -> str:

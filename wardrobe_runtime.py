@@ -23,7 +23,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from .conversation_prompt_section import PromptSection, prompt_section
-from .helpers import _flat_get, _set_into_config, _single_line, _today_key
+from .helpers import _flat_get, _now_ts, _set_into_config, _single_line, _today_key
 from .persona_config import PERSONA_SETTINGS_KEY, runtime_persona_setting
 from .wardrobe import (
     OUTFIT_KIND_BUNDLE,
@@ -149,6 +149,15 @@ WARDROBE_DETAIL_TOOL_NAME = "pc_query_wardrobe_detail"
 # 本会话明确换装（作者的 dialogue_outfit_override）最多带上几件。
 # 上限只是为了把段落长度钉死在 WARDROBE_PROMPT_MAX_CHARS 以内。
 WARDROBE_OVERRIDE_MAX_ITEMS = 12
+
+# 「今天穿什么」这条意图**复用作者已有的存储**，不新开 key：
+# data["dialogue_outfit_override"] 已经接进 4 个消费点（连续性段落 / 日程调整 /
+# scene_context / 状态衰减），core_store 也已登记为可持久化 section。
+WARDROBE_INTENT_KEY = "dialogue_outfit_override"
+# 过期规则跟作者保持一致：当日 + 12 小时，谁先到算谁。
+WARDROBE_INTENT_TTL_SECONDS = 12 * 3600
+# 写入来源标记，只用于面板展示（不参与优先级：按约定后写的覆盖先写的）。
+WARDROBE_INTENT_SOURCE_MODEL = "model_tool"
 
 # 工具回包的上限：它是「按需展开」，不是把整份衣柜倒给模型，所以比注入段落宽松、
 # 但仍有硬上限，避免 40 件长描述把一次工具结果撑成几千字。
@@ -526,20 +535,7 @@ class WardrobeMixin:
         )
         if not user_id:
             return {}
-        getter = getattr(self, "_current_dialogue_outfit_override", None)
-        if not callable(getter):
-            return {}
-        try:
-            snapshot = getter(user_id=user_id)
-        except TypeError:
-            # 宿主签名可能只接受位置参数；退化成不带身份读取。
-            try:
-                snapshot = getter()
-            except Exception:
-                return {}
-        except Exception:
-            return {}
-        return dict(snapshot) if isinstance(snapshot, Mapping) else {}
+        return self._wardrobe_override_snapshot(user_id)
 
     def _wardrobe_override_items(self, snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
         """把意图解析成衣柜里的实物：整套优先，其次是散件 id 列表。"""
@@ -601,6 +597,248 @@ class WardrobeMixin:
                 "不要用清单里的默认搭配把它换回来，也不要声称它出自衣柜。"
             )
         return chr(10).join(lines)
+
+    def _wardrobe_override_snapshot(self, user_id: str = "") -> dict[str, Any]:
+        """原样读作者那套 override（不做身份过滤）；取不到返回 {}。"""
+
+        getter = getattr(self, "_current_dialogue_outfit_override", None)
+        if not callable(getter):
+            return {}
+        try:
+            snapshot = getter(user_id=user_id)
+        except TypeError:
+            # 宿主签名可能只接受位置参数；退化成不带身份读取。
+            try:
+                snapshot = getter()
+            except Exception:
+                return {}
+        except Exception:
+            return {}
+        return dict(snapshot) if isinstance(snapshot, Mapping) else {}
+
+    def _wardrobe_intent_snapshot(self, user: Any = None) -> dict[str, Any]:
+        """给面板/工具看的「本会话已明确换装」：原始字段 + 解析出的实物。
+
+        面板没有用户身份，所以这里**不做身份过滤**（读的是同一个人格下的那一份）。
+        """
+
+        snapshot = self._wardrobe_override_snapshot()
+        if not snapshot:
+            return {}
+        items = self._wardrobe_override_items(snapshot)
+        outfit_id = _single_line(snapshot.get("wardrobe_outfit_id"), 80)
+        outfit_name = ""
+        if outfit_id:
+            for outfit in self._wardrobe_outfits():
+                if str(outfit.get("id") or "") == outfit_id:
+                    outfit_name = str(outfit.get("name") or "")
+                    break
+        return {
+            "instruction": _single_line(snapshot.get("instruction"), 180),
+            "source": _single_line(snapshot.get("source"), 40),
+            "date": _single_line(snapshot.get("date"), 16),
+            "created_at": snapshot.get("created_at"),
+            "expires_at": snapshot.get("expires_at"),
+            "outfit_id": outfit_id,
+            "outfit_name": outfit_name,
+            "items": [
+                {
+                    "id": str(item.get("id") or ""),
+                    "name": str(item.get("name") or ""),
+                    "slot": str(item.get("slot") or ""),
+                }
+                for item in items
+            ],
+        }
+
+    @staticmethod
+    def _wardrobe_intent_tokens(raw: Any) -> list[str]:
+        """把工具传来的那一串名称/id 拆开：逗号、顿号、斜杠、分号、换行都算分隔符。"""
+
+        text = _single_line(raw, 600)
+        if not text:
+            return []
+        tokens: list[str] = []
+        for chunk in text.replace("，", ",").replace("、", ",").replace("/", ",").replace("；", ",").replace(";", ",").split(","):
+            token = _single_line(chunk, 60)
+            if token and token not in tokens:
+                tokens.append(token)
+        return tokens[:WARDROBE_OVERRIDE_MAX_ITEMS]
+
+    def _wardrobe_resolve_intent(
+        self, items: Any = "", outfit: Any = ""
+    ) -> tuple[list[dict[str, Any]], list[str], str, str]:
+        """把工具传来的名称/id 解析成衣柜实物。
+
+        返回 (命中散件, 未命中的名字, 命中整套 id, 命中整套名)。解析规则刻意保守：
+        只认 id、完整名称、以及**唯一**的子串命中 —— 挑错衣服比挑不到更糟。
+        """
+
+        wardrobe_items = self._wardrobe_items()
+        by_id = {str(row.get("id") or ""): row for row in wardrobe_items}
+        by_name: dict[str, dict[str, Any]] = {}
+        for row in wardrobe_items:
+            key = str(row.get("name") or "").strip().casefold()
+            if key:
+                by_name.setdefault(key, row)
+        outfit_rows = self._wardrobe_outfits()
+        outfits_by_id = {str(row.get("id") or ""): row for row in outfit_rows}
+        outfits_by_name: dict[str, dict[str, Any]] = {}
+        for row in outfit_rows:
+            key = str(row.get("name") or "").strip().casefold()
+            if key:
+                outfits_by_name.setdefault(key, row)
+
+        picked: list[dict[str, Any]] = []
+        unresolved: list[str] = []
+        for token in self._wardrobe_intent_tokens(items):
+            row = by_id.get(token) or by_name.get(token.casefold())
+            if row is None:
+                needle = token.casefold()
+                matches = [
+                    candidate
+                    for candidate in wardrobe_items
+                    if needle and needle in str(candidate.get("name") or "").casefold()
+                ]
+                row = matches[0] if len(matches) == 1 else None
+            if row is None:
+                unresolved.append(token)
+                continue
+            if row not in picked:
+                picked.append(row)
+
+        outfit_id = ""
+        outfit_name = ""
+        clean_outfit = _single_line(outfit, 80)
+        if clean_outfit:
+            row = outfits_by_id.get(clean_outfit) or outfits_by_name.get(clean_outfit.casefold())
+            if row is None:
+                unresolved.append(clean_outfit)
+            else:
+                outfit_id = str(row.get("id") or "")
+                outfit_name = str(row.get("name") or "")
+        return picked, unresolved, outfit_id, outfit_name
+
+    def _schedule_wardrobe_intent_save(self) -> None:
+        """把意图落盘。section 名必须是 core_store 登记过的那个，否则直接抛错。"""
+
+        saver = getattr(self, "_schedule_data_save", None)
+        if not callable(saver):
+            return
+        try:
+            saver(sections={WARDROBE_INTENT_KEY})
+        except Exception as exc:
+            logger.warning("穿衣意图落盘失败: %s", _single_line(exc, 160))
+
+    def _wardrobe_set_intent(
+        self, intent: Any = "", *, items: Any = "", outfit: Any = "", user: Any = None
+    ) -> dict[str, Any]:
+        """把「本会话要穿什么」写进作者那套 dialogue_outfit_override。
+
+        与作者的正则写同一个 key、同一套过期规则（当日 + 12h），不新建存储 ——
+        作者的三个消费点（连续性段落 / 日程调整 / scene_context）因此自动生效。
+        按约定，后写的覆盖先写的，source 只用于面板展示。
+        """
+
+        outcome: dict[str, Any] = {
+            "ok": False,
+            "instruction": "",
+            "source": WARDROBE_INTENT_SOURCE_MODEL,
+            "resolved": [],
+            "unresolved": [],
+            "outfit": "",
+            "error": "",
+        }
+        data = getattr(self, "data", None)
+        if not isinstance(data, dict):
+            outcome["error"] = "当前运行时不支持记录穿衣意图。"
+            return outcome
+        picked, unresolved, outfit_id, outfit_name = self._wardrobe_resolve_intent(items, outfit)
+        clean_intent = _single_line(intent, 180)
+        if not clean_intent and not picked and not outfit_id:
+            outcome["error"] = "没有可记录的换装内容：给出想换上的衣物名称，或一句换装描述。"
+            return outcome
+        if not clean_intent:
+            names = "、".join(str(row.get("name") or "") for row in picked) or outfit_name
+            clean_intent = f"换上{names}" if names else "换装"
+        user_id = (
+            _single_line((user or {}).get("user_id"), 80)
+            if isinstance(user, Mapping)
+            else ""
+        )
+        now = _now_ts()
+        snapshot = {
+            "date": _today_key(),
+            "instruction": clean_intent,
+            "source": WARDROBE_INTENT_SOURCE_MODEL,
+            "source_user_id": user_id,
+            "created_at": now,
+            "expires_at": now + WARDROBE_INTENT_TTL_SECONDS,
+            "wardrobe_items": [str(row.get("id") or "") for row in picked],
+            "wardrobe_outfit_id": outfit_id,
+        }
+        data[WARDROBE_INTENT_KEY] = snapshot
+        self._schedule_wardrobe_intent_save()
+        outcome.update(
+            {
+                "ok": True,
+                "instruction": clean_intent,
+                "resolved": [str(row.get("name") or "") for row in picked],
+                "unresolved": unresolved,
+                "outfit": outfit_name,
+                "expires_at": snapshot["expires_at"],
+            }
+        )
+        return outcome
+
+    def _wardrobe_clear_intent(self) -> bool:
+        """清掉本会话的换装意图（面板纠正用）；没有就返回 False。"""
+
+        data = getattr(self, "data", None)
+        if not isinstance(data, dict) or not data.get(WARDROBE_INTENT_KEY):
+            return False
+        data[WARDROBE_INTENT_KEY] = {}
+        self._schedule_wardrobe_intent_save()
+        return True
+
+    def _wardrobe_intent_user(self, event: Any) -> dict[str, Any]:
+        """从事件里定位当前用户：意图要写给他本人，而不是「当前人格的某个人」。"""
+
+        getter = getattr(self, "_event_sender_id", None)
+        user_id = ""
+        if callable(getter):
+            try:
+                user_id = _single_line(getter(event), 80)
+            except Exception:
+                user_id = ""
+        if not user_id:
+            try:
+                user_id = _single_line(event.get_sender_id(), 80)
+            except Exception:
+                user_id = ""
+        loader = getattr(self, "_get_user", None)
+        if user_id and callable(loader):
+            try:
+                record = loader(user_id)
+            except Exception:
+                record = None
+            if isinstance(record, Mapping):
+                return dict(record)
+        return {"user_id": user_id} if user_id else {}
+
+    def _wardrobe_intent_reply(
+        self, intent: Any = "", *, items: Any = "", outfit: Any = "", user: Any = None
+    ) -> str:
+        """工具返回值：JSON 字符串（宿主以 role:"tool" 回灌给模型）。"""
+
+        try:
+            outcome = self._wardrobe_set_intent(intent, items=items, outfit=outfit, user=user)
+        except Exception as exc:
+            logger.warning("记录穿衣意图失败: %s", _single_line(exc, 160))
+            return json.dumps(
+                {"status": "error", "message": "记录穿衣意图失败。"}, ensure_ascii=False
+            )
+        return json.dumps(outcome, ensure_ascii=False)
 
     def _wardrobe_prompt_section(
         self, user: Any = None, text: Any = "", *, detail_tool: bool = False
