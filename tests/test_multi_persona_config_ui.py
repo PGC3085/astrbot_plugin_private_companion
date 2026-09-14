@@ -33,6 +33,27 @@ class MultiPersonaConfigUiTests(unittest.TestCase):
         self.assertEqual(html.count('id="configStats"'), 1)
         self.assertEqual(html.count('id="pagePersonaSelect"'), 1)
 
+    def test_persona_reset_is_a_dedicated_config_maintenance_action(self) -> None:
+        html = (PRIMARY / "index.html").read_text(encoding="utf-8")
+        script = (PRIMARY / "app.js").read_text(encoding="utf-8")
+        import_panel = html.split('<details class="persona-import-panel">', 1)[1].split(
+            "</details>", 1
+        )[0]
+        maintenance = html.split('id="configPersonaMaintenance"', 1)[1].split(
+            "</section>", 1
+        )[0]
+
+        self.assertNotIn("data-reset-current-persona", import_panel)
+        self.assertIn("重置当前查看人格的全部本地数据", maintenance)
+        self.assertIn("重置前会自动备份本地人格资料", maintenance)
+        self.assertIn("人格独立设置", maintenance)
+        self.assertIn("当前人格分域投影会一并清理", maintenance)
+        self.assertIn("其他长期记忆不受影响", maintenance)
+        self.assertIn("function renderPersonaMaintenance()", script)
+        self.assertIn("function currentPersonaMaintenanceTarget()", script)
+        self.assertIn("const selected = currentPersonaMaintenanceTarget();", script)
+        self.assertGreaterEqual(html.count("maintenance=persona-reset-v1"), 2)
+
     def test_persona_selector_is_stateful_and_protects_drafts(self) -> None:
         script = (PRIMARY / "app.js").read_text(encoding="utf-8")
         for marker in (

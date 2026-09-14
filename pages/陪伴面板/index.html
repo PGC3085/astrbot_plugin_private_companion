@@ -163,7 +163,7 @@
   </style>
   <link rel="stylesheet" href="./css/header-tools.css?v=20260713-font-options" />
   <link rel="stylesheet" href="./css/qzone-mobile.css?v=20260711-qzone-image-preview" />
-  <link rel="stylesheet" href="./css/polish.css?v=20260810-responsive-containment-v1&amp;world=20260811-responsive-v2&amp;config=multi-persona-summary-v2&amp;mobile=20260829-overflow-v1&amp;panel=20260913-rollback-v1" />
+  <link rel="stylesheet" href="./css/polish.css?v=20260810-responsive-containment-v1&amp;world=20260811-responsive-v2&amp;config=multi-persona-summary-v2&amp;mobile=20260829-overflow-v1&amp;panel=20260913-rollback-v1&amp;maintenance=persona-reset-v1" />
   <script>
     (function () {
       try {
@@ -1945,6 +1945,23 @@ QQ空间 = 公开札记
               </header>
               <div class="folio-stats config-stats" id="configStats"></div>
             </section>
+            <section class="config-persona-maintenance" id="configPersonaMaintenance" aria-labelledby="configPersonaMaintenanceTitle">
+              <header>
+                <div>
+                  <span class="config-fold-kicker">数据维护</span>
+                  <h2 id="configPersonaMaintenanceTitle">当前人格数据维护</h2>
+                </div>
+                <span id="configPersonaMaintenanceTarget" class="muted" aria-live="polite">当前查看人格</span>
+              </header>
+              <div class="config-persona-maintenance-body">
+                <div>
+                  <b>重置前会自动备份本地人格资料</b>
+                  <p>清空当前查看人格的用户、群聊、日程、状态、日记与本地运行记录；保留插件基础配置、人格独立设置、多人格列表和 AstrBot 路由状态。</p>
+                  <small>同步到 MemoryCompanion 的当前人格分域投影会一并清理；AstrBot 会话历史与 MemoryCompanion 自主管理的其他长期记忆不受影响。</small>
+                </div>
+                <button type="button" class="danger-outline" id="resetCurrentPersonaBtn" data-reset-current-persona>重置当前查看人格的全部本地数据</button>
+              </div>
+            </section>
           </section>
 
           <section class="config-persona-settings" id="config-persona-settings" aria-label="人格配置">
@@ -2376,6 +2393,6 @@ QQ空间 = 公开札记
   <!-- Loaded on demand by app.js through AstrBot's relative dynamic-import rewriting:
        ./js/panels/provider-tree.js?v=20260804-reading-archive-capability-v1&amp;manual=provider-input-v2&amp;layout=v2&amp;vision-state=v1
        ./js/panels/qzone-panel.js?v=20260810-qzone-classic-loader-v1 -->
-  <script src="./app.js?v=20260809-proactive-tts-external-ability-photo-fixed-v1&amp;build=20260810-reference-upload-v2&amp;page=lazy-classic-loader-v1&amp;scope=photo-scope-quota-v1&amp;touch=reality-redesign-rt2-v4&amp;memory-source=memory-companion-v2&amp;user-create=profile-v1&amp;relationship-role-photo=pr125-v1&amp;camera-runtime-scope=v1&amp;config=multi-persona-summary-v2&amp;troubleshooting=persona-routing-lifecycle-v1&amp;content-visibility=v1&amp;migration-notice=v4&amp;component-order=v1&amp;layout=model-routing-v2&amp;persona-style-batch-recovery=v1&amp;preset-save=v1&amp;directory-nav=v2&amp;mihome=external-runtime-v2&amp;terminal=plugin-check-v1&amp;diagnostic-layout=v2&amp;prompts=task-editor-v2&amp;release=6.4.4f&amp;vision-state=v1&amp;retry=20260913-v1&amp;panel=20260913-rollback-v1"></script>
+  <script src="./app.js?v=20260809-proactive-tts-external-ability-photo-fixed-v1&amp;build=20260810-reference-upload-v2&amp;page=lazy-classic-loader-v1&amp;scope=photo-scope-quota-v1&amp;touch=reality-redesign-rt2-v4&amp;memory-source=memory-companion-v2&amp;user-create=profile-v1&amp;relationship-role-photo=pr125-v1&amp;camera-runtime-scope=v1&amp;config=multi-persona-summary-v2&amp;troubleshooting=persona-routing-lifecycle-v1&amp;content-visibility=v1&amp;migration-notice=v4&amp;component-order=v1&amp;layout=model-routing-v2&amp;persona-style-batch-recovery=v1&amp;preset-save=v1&amp;directory-nav=v2&amp;mihome=external-runtime-v2&amp;terminal=plugin-check-v1&amp;diagnostic-layout=v2&amp;prompts=task-editor-v2&amp;release=6.4.4f&amp;vision-state=v1&amp;retry=20260913-v1&amp;panel=20260913-rollback-v1&amp;maintenance=persona-reset-v1"></script>
 </body>
 </html>

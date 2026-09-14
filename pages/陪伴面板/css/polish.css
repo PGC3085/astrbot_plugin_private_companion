@@ -111,6 +111,53 @@
   box-shadow: var(--shadow-ring);
 }
 
+#panel-config .config-persona-maintenance {
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--danger) 24%, var(--line-soft));
+  border-radius: 8px;
+  padding: 14px 16px 16px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--red-soft));
+  box-shadow: var(--shadow-ring);
+}
+
+#panel-config .config-persona-maintenance > header,
+#panel-config .config-persona-maintenance-body {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+#panel-config .config-persona-maintenance > header {
+  align-items: end;
+  margin-bottom: 12px;
+}
+
+#panel-config .config-persona-maintenance h2 {
+  margin: 3px 0 0;
+  font-size: 18px;
+}
+
+#panel-config .config-persona-maintenance-body > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+#panel-config .config-persona-maintenance-body p,
+#panel-config .config-persona-maintenance-body small {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+#panel-config .config-persona-maintenance-body .danger-outline {
+  flex: 0 0 auto;
+  min-height: 38px;
+  max-width: 280px;
+  white-space: normal;
+}
+
 #panel-config .config-persona-stats > header,
 #panel-config .persona-management-head {
   display: flex;
@@ -489,6 +536,8 @@
   }
 
   #panel-config .config-persona-stats > header,
+  #panel-config .config-persona-maintenance > header,
+  #panel-config .config-persona-maintenance-body,
   #panel-config .persona-management-head,
   #panel-config .multi-persona-feature-head,
   #panel-config .persona-topology-form {

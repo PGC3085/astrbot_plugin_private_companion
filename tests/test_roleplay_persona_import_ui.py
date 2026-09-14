@@ -36,6 +36,7 @@ def test_persona_import_keeps_existing_control_contracts() -> None:
     assert 'data-roleplay-draft-scope="persona" checked' in markup
     assert 'id="generateRoleplayDraftBtn"' in markup
     assert 'id="roleplayPersonaDraftPanel"' in markup
+    assert "data-reset-current-persona" not in markup
 
 
 def test_persona_import_preview_preserves_state_and_reopens_disclosure() -> None:

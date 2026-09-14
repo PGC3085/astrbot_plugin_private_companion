@@ -24291,6 +24291,7 @@ function renderConfig() {
   renderAccessManager(group);
   renderMultiPersonaModeSummary();
   renderConfigPersonaSelector();
+  renderPersonaMaintenance();
   renderFeatureSwitches();
   renderConfigBackups();
   renderConfigImportChecks();
@@ -25511,9 +25512,10 @@ function moduleWorkbenchCard(item) {
 
 async function resetPersonaFromPanel(button, personaId, label) {
   const confirmed = window.confirm(
-    `确定重置当前人格“${label}”吗？\n\n旧资料会先备份；插件基础配置、多人格列表和 AstrBot 路由状态会保留。外部长期记忆不会直接删除。`,
+    `确定重置当前查看人格“${label}”的全部本地数据吗？\n\n重置前会自动备份本地人格资料；插件基础配置、人格独立设置、多人格列表和 AstrBot 路由状态会保留。同步到 MemoryCompanion 的当前人格分域投影会一并清理；AstrBot 会话历史与其他长期记忆不受影响。`,
   );
   if (!confirmed) return;
+  setPersonaOperationBusy(true);
   button.disabled = true;
   try {
     const result = await postJson("/persona/reset-current", { persona_id: personaId });
@@ -25537,6 +25539,7 @@ async function resetPersonaFromPanel(button, personaId, label) {
     showToast(error.message || "当前人格重置失败", "error");
   } finally {
     button.disabled = false;
+    setPersonaOperationBusy(false);
   }
 }
 
@@ -25551,29 +25554,41 @@ function renderCurrentPersonaStatus(settings) {
   if ("value" in output) output.value = label;
   else output.textContent = label;
   output.title = label;
-  const host = output.parentElement;
-  if (!host) return;
-  host.querySelectorAll("[data-multi-persona-switcher]").forEach((node) => node.remove());
-  const current = String(selected || state.multiPersona.current || state.multiPersona.primary || personaId || "").trim();
-  if (!state.multiPersona?.enabled) {
-    const wrapper = document.createElement("span");
-    wrapper.dataset.multiPersonaSwitcher = "true";
-    wrapper.className = "setting-inline-control";
-    wrapper.innerHTML = `<button type="button" class="danger-outline" data-reset-current-persona title="备份并重置当前人格资料">重置当前人格</button>`;
-    const resetButton = wrapper.querySelector("[data-reset-current-persona]");
-    resetButton?.addEventListener("click", () => resetPersonaFromPanel(resetButton, personaId, label));
-    host.appendChild(wrapper);
-    return;
-  }
-  const wrapper = document.createElement("span");
-  wrapper.dataset.multiPersonaSwitcher = "true";
-  wrapper.className = "setting-inline-control";
-  wrapper.innerHTML = `<span>页面查看人格</span><b>${escapeHtml(personaDisplayLabel(current))}</b><button type="button" class="danger-outline" data-reset-current-persona title="备份并重置当前人格资料">重置</button>`;
-  const resetButton = wrapper.querySelector("[data-reset-current-persona]");
-  resetButton?.addEventListener("click", () => {
-    resetPersonaFromPanel(resetButton, current, personaDisplayLabel(current));
+}
+
+function currentPersonaMaintenanceTarget() {
+  const settings = state.overview?.settings || {};
+  const personaId = String(state.multiPersona?.enabled
+    ? (
+      selectedPagePersonaId()
+      || state.multiPersona?.current
+      || state.multiPersona?.primary
+      || settings.plugin_specific_persona_id
+      || ""
+    )
+    : (settings.plugin_specific_persona_id || ""),
+  ).trim();
+  return {
+    personaId,
+    label: personaId ? personaDisplayLabel(personaId) : "当前单人格资料",
+  };
+}
+
+function renderPersonaMaintenance() {
+  const root = document.getElementById("configPersonaMaintenance");
+  const button = document.getElementById("resetCurrentPersonaBtn");
+  const target = document.getElementById("configPersonaMaintenanceTarget");
+  if (!root || !button || !target) return;
+  const current = currentPersonaMaintenanceTarget();
+  target.textContent = `当前查看：${current.label}`;
+  button.title = `备份并重置${current.label}的本地陪伴数据`;
+  button.disabled = Number(state.personaOperationBusyCount || 0) > 0;
+  if (button.dataset.bound === "1") return;
+  button.dataset.bound = "1";
+  button.addEventListener("click", () => {
+    const selected = currentPersonaMaintenanceTarget();
+    void resetPersonaFromPanel(button, selected.personaId, selected.label);
   });
-  host.appendChild(wrapper);
 }
 
 function renderMultiPersonaSettingsPanel() {
@@ -34023,6 +34038,8 @@ function setPersonaOperationBusy(busy) {
   if (select) select.disabled = state.personaOperationBusyCount > 0;
   const pageSelect = $("#pagePersonaSelect");
   if (pageSelect) pageSelect.disabled = state.personaOperationBusyCount > 0 || pagePersonaRecords().length <= 1;
+  const resetButton = $("#resetCurrentPersonaBtn");
+  if (resetButton) resetButton.disabled = state.personaOperationBusyCount > 0;
 }
 
 function configSavedValue(result) {
