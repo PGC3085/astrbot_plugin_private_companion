@@ -312,6 +312,25 @@ _LATE_CLAIM_GAP = r"[^。\n]{0,6}"
 # 删除起点：句首或小句边界，避免从句子中间把话切走。
 _CLAUSE_BOUNDARY = r"(?:^|(?<=[。！？!?；;\n])|[。！？!?；;])"
 
+# REQ-041 权威私聊记忆的声明写集：每个写入者只提交自己拥有的字段，
+# 其余字段由权威记录在提交事务内保留，避免并发写入互相整块覆盖。
+_REQ041_DIALOGUE_EPISODE_FIELDS = (
+    "dialogue_episodes",
+    "open_loops",
+    "episode_message_count",
+    "last_episode_refresh_at",
+    "dialogue_episode_retry_after",
+    "dialogue_episode_last_error",
+    "dialogue_episode_running_at",
+)
+_REQ041_COMPANION_MEMORY_FIELDS = (
+    "companion_memory",
+    "last_memory_refresh_at",
+    "companion_memory_retry_after",
+    "companion_memory_last_error",
+    "companion_memory_running_at",
+)
+
 class UserMemoryMixin:
     """用户记忆系统"""
 
@@ -3584,6 +3603,7 @@ class UserMemoryMixin:
         *,
         expected_revision: int,
         operation_id: str,
+        fields: Any = None,
     ) -> bool:
         person_id = _single_line(user.get("unified_person_id"), 80) if isinstance(user, dict) else ""
         if not person_id or not operation_id or not isinstance(getattr(self, "data", None), dict):
@@ -3595,6 +3615,7 @@ class UserMemoryMixin:
                 private_memory_content(user),
                 expected_revision=expected_revision,
                 operation_id=operation_id,
+                fields=fields,
             )
             if result.get("ok") is True:
                 return True
@@ -3613,6 +3634,51 @@ class UserMemoryMixin:
                 _single_line(exc, 120),
             )
             return False
+
+    def _req041_private_memory_person_key(self, user_id: str) -> str:
+        """Stable per-person serialization key: the unified person when known, else the user row."""
+        raw = _single_line(user_id, 160)
+        normalizer = getattr(self, "_canonical_private_user_id", None)
+        canonical = _single_line(normalizer(raw), 160) if callable(normalizer) else ""
+        canonical = canonical or raw
+        users = self.data.get("users") if isinstance(getattr(self, "data", None), dict) else None
+        user = users.get(canonical) if isinstance(users, dict) else None
+        person_id = _single_line(user.get("unified_person_id"), 80) if isinstance(user, dict) else ""
+        return person_id or canonical
+
+    def _req041_person_write_lock(self, person_key: str) -> asyncio.Lock:
+        """Per-person write lock for the REQ-041 background refresh flows."""
+        locks = getattr(self, "_req041_person_write_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._req041_person_write_locks = locks
+        key = _single_line(person_key, 80)
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
+
+    def _req041_record_private_memory_write_failure(
+        self,
+        user: dict[str, Any],
+        *,
+        task: str,
+        now: float,
+    ) -> None:
+        """方案 C：权威写入被拒时不留静默丢弃——错误与退避写回权威记录。"""
+        memory_revision = self._req041_prepare_authoritative_private_memory(user)
+        if memory_revision is None:
+            return
+        user[f"{task}_last_error"] = "private_memory_write_rejected"
+        user[f"{task}_retry_after"] = now + self._user_background_task_retry_delay(task)
+        user[f"{task}_running_at"] = 0
+        self._req041_commit_authoritative_private_memory(
+            user,
+            expected_revision=memory_revision,
+            operation_id=f"req041-{task}-rejected:{uuid.uuid4().hex}",
+            fields=(f"{task}_last_error", f"{task}_retry_after", f"{task}_running_at"),
+        )
 
     def _format_expression_profile_for_prompt(
         self,
@@ -9580,16 +9646,19 @@ Character-specific bottom-line baseline (reference only; empty means use the con
         if not runtime_persona_setting(self, "enable_dialogue_episode_memory", True):
             return
         now = _now_ts()
+        async with self._req041_person_write_lock(self._req041_private_memory_person_key(user_id)):
+            await self._refresh_dialogue_episode_batch(user_id, user, now)
+        return
+
+    async def _refresh_dialogue_episode_batch(self, user_id: str, user: dict[str, Any], now: float) -> None:
+        # CAS 窗口收敛：权威 revision 只在提交侧的同一把 _data_lock 内读取，
+        # 因此「读 -> 计算 -> 写」不再跨越 await，也就不会用陈旧 revision 提交。
         async with self._data_lock:
             current = self._get_user(user_id)
             memory_managed = self._req041_private_memory_managed()
-            memory_revision = (
-                self._req041_prepare_authoritative_private_memory(current)
-                if memory_managed else None
-            )
+            if memory_managed and not self._req041_private_memory_write_allowed(current):
+                return
             user = dict(current)
-        if memory_managed and memory_revision is None:
-            return
         if now < _safe_float(user.get("dialogue_episode_retry_after"), 0):
             return
         count = _safe_int(user.get("episode_message_count"), 0, 0)
@@ -9790,6 +9859,13 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
             if not self._req041_private_memory_write_allowed(current):
                 current["dialogue_episode_running_at"] = 0
                 return
+            memory_revision = (
+                self._req041_prepare_authoritative_private_memory(current)
+                if memory_managed else None
+            )
+            if memory_managed and memory_revision is None:
+                current["dialogue_episode_running_at"] = 0
+                return
             episodes = current.setdefault("dialogue_episodes", [])
             if not isinstance(episodes, list):
                 episodes = []
@@ -9853,12 +9929,31 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
             current["dialogue_episode_retry_after"] = 0
             current["dialogue_episode_last_error"] = ""
             current["dialogue_episode_running_at"] = 0
+            # 方案 E：operation_id 取自 LLM 产物指纹，而不是输入哈希。
+            # 同一段对话在窗口过期后被重新总结属于独立操作，不能被误判成上一次操作的幂等重放。
+            episode_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "episode": episode,
+                        "open_loops": open_loops,
+                        "expression_rules": expression_rules,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
             if memory_managed:
                 if not self._req041_commit_authoritative_private_memory(
                     current,
                     expected_revision=memory_revision,
-                    operation_id=f"req041-dialogue-episode:{user_id}:{expression_batch_key}",
+                    operation_id=f"req041-dialogue-episode:{user_id}:{episode_fingerprint}",
+                    fields=_REQ041_DIALOGUE_EPISODE_FIELDS,
                 ):
+                    self._req041_record_private_memory_write_failure(
+                        current, task="dialogue_episode", now=now,
+                    )
+                    self._save_data_sync(sections={"users", "_req041_private_memory"})
                     return
             save_sections = {"users"}
             if memory_managed:
@@ -10439,16 +10534,18 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
         if not runtime_persona_setting(self, "enable_companion_memory", True):
             return
         now = _now_ts()
+        async with self._req041_person_write_lock(self._req041_private_memory_person_key(user_id)):
+            await self._refresh_companion_memory_batch(user_id, user, now)
+        return
+
+    async def _refresh_companion_memory_batch(self, user_id: str, user: dict[str, Any], now: float) -> None:
+        # CAS 窗口收敛：权威 revision 与提交同处一把 _data_lock，跨 await 的 LLM 调用被排除在窗口外。
         async with self._data_lock:
             current = self._get_user(user_id)
             memory_managed = self._req041_private_memory_managed()
-            memory_revision = (
-                self._req041_prepare_authoritative_private_memory(current)
-                if memory_managed else None
-            )
+            if memory_managed and not self._req041_private_memory_write_allowed(current):
+                return
             user = dict(current)
-        if memory_managed and memory_revision is None:
-            return
         if now < _safe_float(user.get("companion_memory_retry_after"), 0):
             return
         last_at = _safe_float(user.get("last_memory_refresh_at"), 0)
@@ -10567,6 +10664,13 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
             if not self._req041_private_memory_write_allowed(current):
                 current["companion_memory_running_at"] = 0
                 return
+            memory_revision = (
+                self._req041_prepare_authoritative_private_memory(current)
+                if memory_managed else None
+            )
+            if memory_managed and memory_revision is None:
+                current["companion_memory_running_at"] = 0
+                return
             current_memory = current.setdefault("companion_memory", {})
             if isinstance(current_memory, dict):
                 current_memory["profile"] = normalized
@@ -10583,6 +10687,7 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
                     current,
                     expected_revision=memory_revision,
                     operation_id=f"req041-memory-profile:{user_id}:{memory_fingerprint}",
+                    fields=_REQ041_COMPANION_MEMORY_FIELDS,
                 ):
                     return
             save_sections = {"users"}
@@ -10614,10 +10719,7 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
             self._save_data_sync(sections={"users"})
         return True
 
-    async def _mark_user_background_retry(self, user_id: str, task: str, now: float, error: Any) -> None:
-        retry_key = f"{task}_retry_after"
-        error_key = f"{task}_last_error"
-        running_key = f"{task}_running_at"
+    def _user_background_task_retry_delay(self, task: str) -> float:
         if task == "dialogue_episode":
             configured = _safe_int(
                 runtime_persona_setting(self, "episode_memory_refresh_minutes", 90),
@@ -10632,7 +10734,13 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
             ) * 60
         else:
             configured = 10 * 60
-        delay = min(max(10 * 60, configured), 30 * 60)
+        return float(min(max(10 * 60, configured), 30 * 60))
+
+    async def _mark_user_background_retry(self, user_id: str, task: str, now: float, error: Any) -> None:
+        retry_key = f"{task}_retry_after"
+        error_key = f"{task}_last_error"
+        running_key = f"{task}_running_at"
+        delay = self._user_background_task_retry_delay(task)
         async with self._data_lock:
             current = self._get_user(user_id)
             current[retry_key] = now + delay

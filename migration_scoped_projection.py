@@ -426,7 +426,7 @@ class ScopedProjectionSynchronizer:
             if isinstance(authoritative_record, dict):
                 raw_content = authoritative_record.get("content")
                 if not isinstance(raw_content, dict):
-                    raise ScopedProjectionError("private_memory_record_invalid")
+                    raise ScopedProjectionError("private_memory_content_not_dict")
                 authoritative_content = raw_content
                 authoritative_revision = int(authoritative_record.get("revision") or 0)
             preferred = str((facts or {}).get("preferred_address") or "").strip()

@@ -6536,6 +6536,7 @@ class PrivateCompanionPlugin(
                 logger.warning(
                     "[PrivateCompanion] 记忆作用域补绑定暂未完成，将重试: %s",
                     _single_line(exc, 160),
+                    exc_info=True,
                 )
                 await asyncio.sleep(2.0)
                 continue
@@ -20593,6 +20594,7 @@ class PrivateCompanionPlugin(
                         user,
                         expected_revision=memory_revision,
                         operation_id="req041-command-open-loop:" + uuid.uuid4().hex,
+                        fields=("open_loops",),
                     )
                     if committed:
                         save_sections = {"users"}

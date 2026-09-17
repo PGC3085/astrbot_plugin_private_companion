@@ -35,6 +35,7 @@ PRIVATE_MEMORY_FIELDS = (
 )
 _ROOT_KEY = "_req041_private_memory"
 _SCHEMA = "req041.person_private_memory.v1"
+_OPERATION_LOG_LIMIT = 32
 
 
 class AuthoritativePrivateMemoryError(RuntimeError):
@@ -102,6 +103,52 @@ def apply_private_memory_content(user: dict[str, Any], content: dict[str, Any]) 
             user.pop(field, None)
 
 
+def _write_fields(fields: Any) -> tuple[str, ...]:
+    """Normalize a declared write set; ``None`` means the whole memory field list."""
+    if fields is None:
+        return PRIVATE_MEMORY_FIELDS
+    if isinstance(fields, str) or not isinstance(fields, (list, tuple, set, frozenset)):
+        raise AuthoritativePrivateMemoryError("private_memory_fields_invalid")
+    requested = set(fields)
+    if requested - set(PRIVATE_MEMORY_FIELDS):
+        raise AuthoritativePrivateMemoryError("private_memory_fields_invalid")
+    return tuple(field for field in PRIVATE_MEMORY_FIELDS if field in requested)
+
+
+def _operation_log(record: Any) -> dict[str, Any]:
+    operations = record.get("operations") if isinstance(record, dict) else None
+    return operations if isinstance(operations, dict) else {}
+
+
+def _field_revisions(record: Any) -> dict[str, int]:
+    """Per-field last-write revision; legacy records fall back to a conservative backfill."""
+    current_revision = int(record.get("revision") or 0) if isinstance(record, dict) else 0
+    raw = record.get("field_revisions") if isinstance(record, dict) else None
+    revisions = {
+        field: int(value)
+        for field, value in (raw.items() if isinstance(raw, dict) else ())
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+    content = record.get("content") if isinstance(record, dict) else None
+    content = content if isinstance(content, dict) else {}
+    for field in content:
+        revisions.setdefault(field, current_revision)
+    return revisions
+
+
+def _record_operation(
+    operations: dict[str, Any], operation_hash: str, request_hash: str, revision: int, now: float,
+) -> None:
+    """Append to the bounded idempotency log; only hashes are persisted."""
+    operations[operation_hash] = {
+        "request_hash": request_hash,
+        "revision": revision,
+        "recorded_at": now,
+    }
+    for stale in list(operations)[:-_OPERATION_LOG_LIMIT]:
+        operations.pop(stale, None)
+
+
 class AuthoritativePrivateMemoryStore:
     def __init__(self, snapshot: dict[str, Any], *, clock: Any = None) -> None:
         if not isinstance(snapshot, dict):
@@ -135,18 +182,44 @@ class AuthoritativePrivateMemoryStore:
         if raw is None:
             return {"ok": True, "code": "not_found", "record": None}
         if not isinstance(raw, dict):
-            raise AuthoritativePrivateMemoryError("private_memory_record_invalid")
+            raise AuthoritativePrivateMemoryError("private_memory_record_not_dict")
         content = raw.get("content")
         revision = raw.get("revision")
+        # Split one opaque code into the four conditions it used to cover.  The
+        # original single code made a field report impossible to act on: it
+        # could not be told apart from "content is not a dict", "revision is
+        # illegal", "schema mismatch" or "content_hash mismatch".  The message
+        # carries the structural shape of the offending record, never its
+        # memory text.
+        if not isinstance(content, dict):
+            raise AuthoritativePrivateMemoryError(
+                "private_memory_content_not_dict: content_type=%s raw_keys=%s"
+                % (type(content).__name__, sorted(raw)[:12])
+            )
         if (
-            not isinstance(content, dict)
-            or not isinstance(revision, int)
+            not isinstance(revision, int)
             or isinstance(revision, bool)
             or revision < 1
-            or raw.get("schema") != _SCHEMA
-            or raw.get("content_hash") != _digest(content)
         ):
-            raise AuthoritativePrivateMemoryError("private_memory_record_invalid")
+            raise AuthoritativePrivateMemoryError(
+                "private_memory_revision_invalid: revision=%r revision_type=%s"
+                % (revision, type(revision).__name__)
+            )
+        if raw.get("schema") != _SCHEMA:
+            raise AuthoritativePrivateMemoryError(
+                "private_memory_schema_mismatch: schema=%r expected=%r"
+                % (raw.get("schema"), _SCHEMA)
+            )
+        if raw.get("content_hash") != _digest(content):
+            raise AuthoritativePrivateMemoryError(
+                "private_memory_hash_mismatch: stored=%r recomputed=%r revision=%r content_keys=%s"
+                % (
+                    raw.get("content_hash"),
+                    _digest(content),
+                    revision,
+                    sorted(content)[:12],
+                )
+            )
         return {"ok": True, "code": "found", "record": deepcopy(raw)}
 
     def commit(
@@ -156,15 +229,28 @@ class AuthoritativePrivateMemoryStore:
         *,
         expected_revision: int,
         operation_id: str,
+        fields: Any = None,
     ) -> dict[str, Any]:
+        """Commit a field-scoped delta.
+
+        ``fields`` declares the write set owned by this writer. Fields listed there but absent
+        from ``content`` are deleted; fields outside the write set are left untouched. ``None``
+        keeps the historical whole-record replacement contract.
+        """
         person = _token(person_id, 80)
         operation = _token(operation_id, 160)
         if not person or not operation or isinstance(expected_revision, bool) or expected_revision < 0:
             raise AuthoritativePrivateMemoryError("private_memory_commit_invalid")
         if not isinstance(content, dict) or set(content) - set(PRIVATE_MEMORY_FIELDS):
             raise AuthoritativePrivateMemoryError("private_memory_fields_invalid")
-        safe_content = {key: _bounded(deepcopy(value)) for key, value in content.items()}
-        content_hash = _digest(safe_content)
+        write_fields = _write_fields(fields)
+        delta = {
+            field: _bounded(deepcopy(content[field]))
+            for field in write_fields
+            if field in content
+        }
+        deleted_fields = tuple(field for field in write_fields if field not in delta)
+        content_hash = _digest({"set": delta, "delete": list(deleted_fields)})
         operation_hash = hashlib.sha256(operation.encode("utf-8")).hexdigest()
         request_hash = _digest({
             "person_id": person,
@@ -176,31 +262,64 @@ class AuthoritativePrivateMemoryStore:
         records = root["records"]
         current = records.get(person)
         current_revision = int(current.get("revision") or 0) if isinstance(current, dict) else 0
-        if isinstance(current, dict) and current.get("last_operation_hash") == operation_hash:
-            if current.get("last_request_hash") != request_hash:
+        # 1) Idempotency first: a replay of an accepted operation always wins, revision aside.
+        operations = _operation_log(current)
+        prior = operations.get(operation_hash)
+        if isinstance(prior, dict):
+            if prior.get("request_hash") != request_hash:
                 return {"ok": False, "code": "operation_id_conflict", "revision": current_revision}
-            return {"ok": True, "code": "idempotent", "revision": current_revision, "record": deepcopy(current)}
-        if current_revision != expected_revision:
             return {
-                "ok": False,
-                "code": "private_memory_revision_conflict",
+                "ok": True,
+                "code": "idempotent",
                 "revision": current_revision,
+                "record": deepcopy(current),
             }
-        if isinstance(current, dict) and current.get("content_hash") == content_hash:
+        # 2) CAS inside this critical section, scoped to the declared write set: a writer may
+        #    converge onto a newer revision, but never onto fields another writer just changed.
+        field_revisions = _field_revisions(current)
+        if current_revision != expected_revision:
+            if current_revision < expected_revision or any(
+                field_revisions.get(field, 0) > expected_revision for field in write_fields
+            ):
+                return {
+                    "ok": False,
+                    "code": "private_memory_revision_conflict",
+                    "revision": current_revision,
+                }
+        current_content = current.get("content") if isinstance(current, dict) else None
+        merged = {
+            field: deepcopy(value)
+            for field, value in (current_content if isinstance(current_content, dict) else {}).items()
+        }
+        merged.update(deepcopy(delta))
+        for field in deleted_fields:
+            merged.pop(field, None)
+        merged_hash = _digest(merged)
+        now = float(self._clock())
+        if isinstance(current, dict) and current.get("content_hash") == merged_hash:
+            _record_operation(operations, operation_hash, request_hash, current_revision, now)
+            current["operations"] = operations
             return {
                 "ok": True,
                 "code": "unchanged",
                 "revision": current_revision,
                 "record": deepcopy(current),
             }
+        revision = current_revision + 1
+        for field in write_fields:
+            if field in merged:
+                field_revisions[field] = revision
+            else:
+                field_revisions.pop(field, None)
+        _record_operation(operations, operation_hash, request_hash, revision, now)
         record = {
             "schema": _SCHEMA,
-            "revision": current_revision + 1,
-            "content": safe_content,
-            "content_hash": content_hash,
-            "updated_at": float(self._clock()),
-            "last_operation_hash": operation_hash,
-            "last_request_hash": request_hash,
+            "revision": revision,
+            "content": merged,
+            "content_hash": merged_hash,
+            "updated_at": now,
+            "field_revisions": field_revisions,
+            "operations": operations,
         }
         records[person] = record
         return {
