@@ -2154,6 +2154,30 @@ class WardrobeOutfitGeneratorTests(unittest.TestCase):
         self.assertIn("每个部位最多选一件", request)
         self.assertIn('"summary"', request)
 
+    def test_request_excludes_reference_items_but_keeps_reference_style_hints(self) -> None:
+        items = normalize_wardrobe_items(
+            [
+                {"name": "自己的针织衫", "slot": "upper", "ownership": "owned"},
+                {"name": "博主的参考外套", "slot": "upper", "ownership": "reference"},
+            ]
+        )
+        outfits = normalize_wardrobe_outfits(
+            [
+                {
+                    "name": "博主叠穿参考",
+                    "kind": "style",
+                    "style": "衬衫叠针织马甲",
+                    "ownership": "reference",
+                }
+            ]
+        )
+
+        request = build_wardrobe_outfit_request(items, outfits, scene="daily")
+
+        self.assertIn("自己的针织衫", request)
+        self.assertNotIn("博主的参考外套", request)
+        self.assertIn("衬衫叠针织马甲", request)
+
     def test_generation_cache_key_tracks_persona_and_wardrobe_content(self) -> None:
         plugin = _WardrobeCommandHarness()
         plugin.config["wardrobe_items"] = [{"name": "开衫", "description": "米色"}]

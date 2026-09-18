@@ -2256,8 +2256,13 @@ def build_wardrobe_outfit_request(
     instead of approximating it.
     """
 
+    owned_items = [
+        item
+        for item in normalize_wardrobe_items(list(items or ()))
+        if str(item.get("ownership") or OWNERSHIP_OWNED) == OWNERSHIP_OWNED
+    ]
     inventory = render_wardrobe_block(
-        "", items, max_items=max_items, max_chars=max_chars
+        "", owned_items, max_items=max_items, max_chars=max_chars
     )
     heading = "衣柜里的具体衣物："
     if inventory.startswith(heading):
