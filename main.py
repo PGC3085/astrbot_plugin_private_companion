@@ -12067,6 +12067,26 @@ class PrivateCompanionPlugin(
                         pass
         return final_chunks, changed, full_text
 
+    @staticmethod
+    def _event_can_deliver_directly(event: AstrMessageEvent) -> bool:
+        """判断 ``event.send()`` 是否真的会把消息投递到平台。
+
+        AstrBot 基类 ``AstrMessageEvent.send()`` 是空实现：只上传一次埋点、
+        设置 ``_has_send_oper`` 标志位，既不发送也不抛异常；只有平台适配器子类
+        才重写它。外部插件（例如屏幕伴侣）会自行构造基类合成事件来触发
+        ``OnDecoratingResultEvent``，这类事件调用 ``send()`` 会静默丢弃消息，
+        必须改走平台直发。
+
+        返回 True 表示可以安全使用 ``event.send()``。
+        """
+        try:
+            # 本项目导入的 AstrMessageEvent 就是基类本体
+            # （astrbot.api.event → astrbot.core.platform → astr_message_event）。
+            return type(event).send is not AstrMessageEvent.send
+        except Exception:
+            # 判定失败时保持原行为，避免误伤正常链路
+            return True
+
     async def _send_segmented_remainder_chain(
         self,
         event: AstrMessageEvent,
@@ -12081,7 +12101,11 @@ class PrivateCompanionPlugin(
             getattr(event, "_private_companion_proactive_delivery_umo", ""),
             240,
         )
-        if external_proactive or proactive_delivery_umo:
+        if (
+            external_proactive
+            or proactive_delivery_umo
+            or not self._event_can_deliver_directly(event)
+        ):
             umo = proactive_delivery_umo or _single_line(
                 getattr(event, "unified_msg_origin", ""),
                 240,
@@ -12287,9 +12311,25 @@ class PrivateCompanionPlugin(
                         )
                         return
                     try:
-                        await event.send(
-                            self._segmented_result_from_chain(event, outbound_chunk)
-                        )
+                        if not self._event_can_deliver_directly(event):
+                            sender = getattr(self, "_send_chain_components", None)
+                            fallback_umo = _single_line(
+                                getattr(event, "unified_msg_origin", ""),
+                                240,
+                            )
+                            if not fallback_umo or not callable(sender):
+                                raise RuntimeError("被动分段补发缺少可用的平台发送入口")
+                            accepted = await sender(
+                                fallback_umo,
+                                list(outbound_chunk),
+                                apply_decorating_hooks=False,
+                            )
+                            if not accepted:
+                                raise RuntimeError("被动分段补发未被平台接受")
+                        else:
+                            await event.send(
+                                self._segmented_result_from_chain(event, outbound_chunk)
+                            )
                         if case_id:
                             self._update_daily_review_case(
                                 case_id,
