@@ -117,16 +117,43 @@ def _write_fields(fields: Any) -> tuple[str, ...]:
 
 def _operation_log(record: Any) -> dict[str, Any]:
     operations = record.get("operations") if isinstance(record, dict) else None
-    return operations if isinstance(operations, dict) else {}
+    result = operations if isinstance(operations, dict) else {}
+    if not isinstance(record, dict):
+        return result
+    legacy_operation = record.get("last_operation_hash")
+    legacy_request = record.get("last_request_hash")
+    if (
+        isinstance(legacy_operation, str)
+        and legacy_operation
+        and isinstance(legacy_request, str)
+        and legacy_request
+        and legacy_operation not in result
+    ):
+        result[legacy_operation] = {
+            "request_hash": legacy_request,
+            "revision": int(record.get("revision") or 0),
+            "recorded_at": float(record.get("updated_at") or 0.0),
+            "hash_version": "legacy_v1",
+        }
+    return result
 
 
 def _field_revisions(record: Any) -> dict[str, int]:
     """Per-field last-write revision; legacy records fall back to a conservative backfill."""
     current_revision = int(record.get("revision") or 0) if isinstance(record, dict) else 0
     raw = record.get("field_revisions") if isinstance(record, dict) else None
+    if not isinstance(raw, dict):
+        # Legacy commits replaced the whole record, so an absent field was an
+        # explicit deletion at the record revision. Mark every field to keep
+        # stale post-upgrade writers fail-closed.
+        return {
+            field: current_revision
+            for field in PRIVATE_MEMORY_FIELDS
+            if current_revision > 0
+        }
     revisions = {
         field: int(value)
-        for field, value in (raw.items() if isinstance(raw, dict) else ())
+        for field, value in raw.items()
         if isinstance(value, int) and not isinstance(value, bool)
     }
     content = record.get("content") if isinstance(record, dict) else None
@@ -266,7 +293,16 @@ class AuthoritativePrivateMemoryStore:
         operations = _operation_log(current)
         prior = operations.get(operation_hash)
         if isinstance(prior, dict):
-            if prior.get("request_hash") != request_hash:
+            prior_request_hash = prior.get("request_hash")
+            request_matches = prior_request_hash == request_hash
+            if prior.get("hash_version") == "legacy_v1":
+                legacy_request_hash = _digest({
+                    "person_id": person,
+                    "expected_revision": expected_revision,
+                    "content_hash": _digest(delta),
+                })
+                request_matches = fields is None and prior_request_hash == legacy_request_hash
+            if not request_matches:
                 return {"ok": False, "code": "operation_id_conflict", "revision": current_revision}
             return {
                 "ok": True,
@@ -307,10 +343,10 @@ class AuthoritativePrivateMemoryStore:
             }
         revision = current_revision + 1
         for field in write_fields:
-            if field in merged:
-                field_revisions[field] = revision
-            else:
-                field_revisions.pop(field, None)
+            # Keep a tombstone revision for deletions. Without it, a writer
+            # based on an older revision could recreate a field that a newer
+            # commit deliberately removed and bypass same-field CAS.
+            field_revisions[field] = revision
         _record_operation(operations, operation_hash, request_hash, revision, now)
         record = {
             "schema": _SCHEMA,

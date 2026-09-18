@@ -10689,6 +10689,10 @@ bot_promises 只记录 Bot 明确承诺要提醒、记住、转述、发送或�
                     operation_id=f"req041-memory-profile:{user_id}:{memory_fingerprint}",
                     fields=_REQ041_COMPANION_MEMORY_FIELDS,
                 ):
+                    self._req041_record_private_memory_write_failure(
+                        current, task="companion_memory", now=now,
+                    )
+                    self._save_data_sync(sections={"users", "_req041_private_memory"})
                     return
             save_sections = {"users"}
             if memory_managed:

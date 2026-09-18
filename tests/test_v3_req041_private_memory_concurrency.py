@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -18,6 +19,7 @@ import unittest
 from authoritative_private_memory import (
     AuthoritativePrivateMemoryStore,
     PRIVATE_MEMORY_FIELDS,
+    _digest,
     private_memory_content,
 )
 from astrbot_plugin_private_companion import user_memory as user_memory_module
@@ -324,6 +326,48 @@ class Req041ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             content.get("last_episode_refresh_at", 0),
         )
 
+    async def test_companion_refresh_failure_is_recorded_in_authoritative_record(self):
+        """陪伴画像提交被拒时也必须写入错误与退避，不能静默返回。"""
+        host = _ConcurrentMemoryHost()
+        host.seed_person()
+        host.bootstrap_record()
+        host.llm_payloads = {
+            "memory_profile": {"strong_memories": ["会被拒绝"]},
+        }
+        original_commit = host._req041_commit_authoritative_private_memory
+        calls = {"count": 0}
+
+        def rejecting_first_commit(user, *, expected_revision, operation_id, fields=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return original_commit(
+                    user,
+                    expected_revision=0,
+                    operation_id=operation_id,
+                    fields=fields,
+                )
+            return original_commit(
+                user,
+                expected_revision=expected_revision,
+                operation_id=operation_id,
+                fields=fields,
+            )
+
+        host._req041_commit_authoritative_private_memory = rejecting_first_commit
+        await host._maybe_refresh_companion_memory("u1", host._get_user("u1"))
+
+        self.assertGreaterEqual(calls["count"], 2)
+        content = host.content()
+        self.assertNotIn("profile", content["companion_memory"])
+        self.assertEqual(
+            "private_memory_write_rejected",
+            content.get("companion_memory_last_error"),
+        )
+        self.assertGreater(
+            content.get("companion_memory_retry_after", 0),
+            content.get("last_memory_refresh_at", 0),
+        )
+
 
 class Req041StoreContractTests(unittest.TestCase):
     def test_legacy_whole_record_stale_commit_still_loses_the_other_batch(self):
@@ -436,6 +480,76 @@ class Req041StoreContractTests(unittest.TestCase):
             store.read("person-1")["record"]["content"]["companion_memory"]["items"][0]["text"],
         )
 
+    def test_stale_write_after_field_deletion_is_still_rejected(self):
+        """删除也必须留下 revision tombstone，防止陈旧任务把字段复活。"""
+        snapshot: dict = {}
+        store = AuthoritativePrivateMemoryStore(snapshot)
+        created = store.commit(
+            "person-1",
+            {"companion_memory": {"items": [{"text": "canonical"}]}},
+            expected_revision=0,
+            operation_id="create",
+            fields=("companion_memory",),
+        )
+        self.assertEqual("created", created["code"])
+        deleted = store.commit(
+            "person-1",
+            {},
+            expected_revision=1,
+            operation_id="delete",
+            fields=("companion_memory",),
+        )
+        self.assertEqual("updated", deleted["code"])
+        self.assertNotIn(
+            "companion_memory",
+            store.read("person-1")["record"]["content"],
+        )
+
+        stale = store.commit(
+            "person-1",
+            {"companion_memory": {"items": [{"text": "stale-revival"}]}},
+            expected_revision=1,
+            operation_id="stale-after-delete",
+            fields=("companion_memory",),
+        )
+
+        self.assertFalse(stale["ok"])
+        self.assertEqual("private_memory_revision_conflict", stale["code"])
+        self.assertNotIn(
+            "companion_memory",
+            store.read("person-1")["record"]["content"],
+        )
+
+    def test_legacy_whole_record_backfill_protects_absent_fields(self):
+        """旧版整块记录中的缺失字段也代表在该 revision 被删除。"""
+        snapshot: dict = {}
+        store = AuthoritativePrivateMemoryStore(snapshot)
+        created = store.commit(
+            "person-1",
+            {"dialogue_episodes": [{"summary": "legacy"}]},
+            expected_revision=0,
+            operation_id="legacy-create",
+        )
+        self.assertEqual("created", created["code"])
+        record = snapshot["_req041_private_memory"]["records"]["person-1"]
+        record.pop("field_revisions", None)
+        record.pop("operations", None)
+
+        stale = store.commit(
+            "person-1",
+            {"companion_memory": {"items": [{"text": "stale-revival"}]}},
+            expected_revision=0,
+            operation_id="stale-after-upgrade",
+            fields=("companion_memory",),
+        )
+
+        self.assertFalse(stale["ok"])
+        self.assertEqual("private_memory_revision_conflict", stale["code"])
+        self.assertNotIn(
+            "companion_memory",
+            store.read("person-1")["record"]["content"],
+        )
+
     def test_disjoint_write_sets_accept_a_stale_base_without_losing_fields(self):
         """disjoint 写集：陈旧 base 不再产生伪冲突，双方字段都必须保留。"""
         snapshot: dict = {}
@@ -502,6 +616,50 @@ class Req041StoreContractTests(unittest.TestCase):
         serialized = repr(record["operations"])
         self.assertNotIn("secret-operation-value", serialized)
         self.assertNotIn("bulk-59", serialized)
+
+    def test_legacy_single_slot_idempotency_survives_upgrade(self):
+        """升级后仍识别旧版最后一笔成功操作，不把安全重试误报为冲突。"""
+        person_id = "person-1"
+        operation_id = "legacy-operation"
+        content = {"open_loops": [{"text": "one"}]}
+        content_hash = _digest(content)
+        request_hash = _digest(
+            {
+                "person_id": person_id,
+                "expected_revision": 0,
+                "content_hash": content_hash,
+            }
+        )
+        snapshot = {
+            "_req041_private_memory": {
+                "schema": "req041.person_private_memory.v1",
+                "records": {
+                    person_id: {
+                        "schema": "req041.person_private_memory.v1",
+                        "revision": 1,
+                        "content": content,
+                        "content_hash": content_hash,
+                        "updated_at": 1.0,
+                        "last_operation_hash": hashlib.sha256(
+                            operation_id.encode("utf-8")
+                        ).hexdigest(),
+                        "last_request_hash": request_hash,
+                    }
+                },
+            }
+        }
+        store = AuthoritativePrivateMemoryStore(snapshot)
+
+        replay = store.commit(
+            person_id,
+            content,
+            expected_revision=0,
+            operation_id=operation_id,
+        )
+
+        self.assertTrue(replay["ok"])
+        self.assertEqual("idempotent", replay["code"])
+        self.assertEqual(1, replay["revision"])
 
     def test_undeclared_write_set_keeps_the_whole_record_replacement_contract(self):
         """未声明写集时仍是整块替换契约（前台 3 个写入者行为不变）。"""
