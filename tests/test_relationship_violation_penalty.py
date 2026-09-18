@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from helpers import _now_ts, _safe_float, _safe_int, _single_line
-from persona_config import runtime_persona_setting
-from relationship_ledger import apply_relationship_event
+from astrbot_plugin_private_companion.helpers import _now_ts, _safe_float, _safe_int, _single_line
+from astrbot_plugin_private_companion.persona_config import runtime_persona_setting
+from astrbot_plugin_private_companion.relationship_ledger import apply_relationship_event
 
 
 ROOT = Path(__file__).resolve().parents[1]
